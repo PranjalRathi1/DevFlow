@@ -280,6 +280,14 @@ runtime usage.
 
 Request: `{ "requirementId": string, "scanId"?: string }`.
 
+A grounded prompt is fitted to the model's budget deterministically
+(ADR-027). `sourceContext.fitting` records `budgetTokens`,
+`estimatedTokensBefore`/`After`, the `steps` applied in order, and
+`reductions` (`{ section, shown, total }`, with exact totals). `steps` is
+empty when the full context fit. If even the smallest safe context
+doesn't fit, the response is `422` ("smallest safe planning context …"),
+returned before any AI call.
+
 Optional `impactFile` (requires `scanId`; same path rules; `400` if unsafe
 or given without `scanId`, `404` if it isn't a file this scan observed,
 checked before any AI call). The target's bounded change impact (ADR-023,

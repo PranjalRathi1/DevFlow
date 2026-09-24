@@ -69,6 +69,33 @@ const sourceContextSchema = new Schema(
     },
     focusTerms: { type: [String], default: [] },
     focusFiles: { type: [String], default: [] },
+    // Stage 12 (ADR-027): how the context was fitted to the model's budget.
+    // `steps` empty = the full context fit. Absent on older plans.
+    fitting: {
+      type: new Schema(
+        {
+          budgetTokens: { type: Number, required: true },
+          estimatedTokensBefore: { type: Number, required: true },
+          estimatedTokensAfter: { type: Number, required: true },
+          steps: { type: [String], default: [] },
+          reductions: {
+            type: [
+              new Schema(
+                {
+                  section: { type: String, required: true },
+                  shown: { type: Number, required: true },
+                  total: { type: Number, required: true },
+                },
+                { _id: false },
+              ),
+            ],
+            default: [],
+          },
+        },
+        { _id: false },
+      ),
+      default: undefined,
+    },
     // Stage 4: the optional impact target and what the model was shown.
     impact: {
       type: new Schema(

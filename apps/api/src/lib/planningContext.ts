@@ -19,7 +19,8 @@ import {
 
 // 2: compact importer-grouped edge format (ADR-020).
 // 3: requirement focus section (ADR-021).
-export const PLANNING_CONTEXT_VERSION = 3;
+// 4: deterministic budget fitting with a reduction note (ADR-027).
+export const PLANNING_CONTEXT_VERSION = 4;
 
 // Caps keep the prompt within a local model's practical context window.
 // Truncation is always reported (never silent) — see `truncated`.
@@ -47,6 +48,41 @@ export const PLANNING_CONTEXT_LIMITS = {
   focusTestDepth: 6,
   focusTraversalNodes: 200,
 } as const;
+
+export type PlanningContextLimits = { -readonly [K in keyof typeof PLANNING_CONTEXT_LIMITS]: number };
+
+/** One list the budget fitter shortened: what was kept vs the exact total (ADR-027). */
+export interface BudgetReduction {
+  section: string;
+  shown: number;
+  total: number;
+}
+
+/** Set only on a context produced by the budget fitter (lib/contextFitting.ts). */
+export interface ContextBudget {
+  budgetTokens: number;
+  estimatedTokensBefore: number;
+  estimatedTokensAfter: number;
+  /** Ids of the reduction steps applied, in order. Empty = the full context fit. */
+  steps: string[];
+  reductions: BudgetReduction[];
+}
+
+/**
+ * Deterministic bounded selection. Untouched when the list fits. When it
+ * must be cut, items for which `isPriority` holds are kept first, then the
+ * rest in their existing (sorted) order; the kept items are returned in
+ * that original order, so the output never depends on input order.
+ */
+function selectBounded<T>(list: readonly T[], cap: number, isPriority?: (item: T) => boolean): T[] {
+  if (list.length <= cap) return [...list];
+  if (!isPriority) return list.slice(0, cap);
+  const indexed = list.map((item, index) => ({ item, index }));
+  const chosen = [...indexed.filter((x) => isPriority(x.item)), ...indexed.filter((x) => !isPriority(x.item))]
+    .slice(0, cap)
+    .sort((a, b) => a.index - b.index);
+  return chosen.map((x) => x.item);
+}
 
 export interface PlanningInventoryItem {
   relativePath: string;
@@ -145,6 +181,8 @@ export interface PlanningContext {
   focus: RequirementFocus | null;
   /** Stage 5: how much of the tree the scan actually read. */
   coverage: { stoppedEarly: string[]; unreadDirectories: number; ignoredDirectories: number };
+  /** Stage 12: present only when the budget fitter produced this context. */
+  budget?: ContextBudget | undefined;
 }
 
 /** Collapses whitespace and caps length — raw import text can be a multi-line source snippet. */
@@ -326,8 +364,9 @@ function basenameTokens(p: string): Set<string> {
 export function buildRequirementFocus(
   requirement: { title: string; description?: string | undefined },
   graph: Pick<DependencyGraphResult, "nodes" | "edges">,
+  limits: PlanningContextLimits = PLANNING_CONTEXT_LIMITS,
 ): RequirementFocus {
-  const L = PLANNING_CONTEXT_LIMITS;
+  const L = limits;
   const titleTerms = new Set(focusTokens(requirement.title));
   const allTerms = new Set([...titleTerms, ...focusTokens(requirement.description ?? "")]);
   const terms = [...allTerms].sort((a, b) => a.localeCompare(b));
@@ -404,9 +443,15 @@ export function buildPlanningContext(input: {
   requirement?: { title: string; description?: string | undefined } | undefined;
   /** The scan's `summary.limitsReached` (Stage 5). */
   limitsReached?: readonly string[] | undefined;
+  /** Stage 12: per-list caps lower than the defaults (budget fitting only). */
+  limits?: Partial<PlanningContextLimits> | undefined;
+  /** Stage 12: files whose items are kept first when a list must be cut. */
+  priorityFiles?: ReadonlySet<string> | undefined;
 }): PlanningContext {
-  const L = PLANNING_CONTEXT_LIMITS;
+  const L: PlanningContextLimits = { ...PLANNING_CONTEXT_LIMITS, ...input.limits };
   const { graph } = input;
+  const pri = input.priorityFiles && input.priorityFiles.size > 0 ? input.priorityFiles : undefined;
+  const touches = pri ? (...paths: string[]) => paths.some((p) => pri.has(p)) : undefined;
 
   const allFiles = input.items
     .filter((i) => i.type === "file" && i.skipReason !== "symlink")
@@ -439,15 +484,26 @@ export function buildPlanningContext(input: {
   const unsupported = graph.unsupported.map(toContextRelationship).sort(byLocation);
   const parseErrors = graph.parseErrors.map(toContextRelationship).sort(byLocation);
 
+  // Without `priorityFiles` every selection is a plain sorted prefix — the
+  // exact pre-Stage-12 behaviour.
+  const files = selectBounded(allFiles, L.files, touches && ((f) => touches(f)));
+  const edges = selectBounded(allEdges, L.edges, touches && ((e) => touches(e.from, e.to)));
+  const byImporter = touches && ((r: ContextRelationship) => touches(r.importerRelativePath));
+  const keptUnresolved = selectBounded(unresolved, L.unresolved, byImporter);
+  const keptUnsupported = selectBounded(unsupported, L.unsupported, byImporter);
+  const keptParseErrors = selectBounded(parseErrors, L.parseErrors, byImporter);
+  const keptPackages = selectBounded(allPackages, L.externalPackages);
+  const keptCycles = selectBounded(graph.cycles, L.cycles, touches && ((c) => touches(...c)));
+
   const truncated =
-    allFiles.length > L.files ||
-    allEdges.length > L.edges ||
-    unresolved.length > L.unresolved ||
-    allPackages.length > L.externalPackages ||
-    unsupported.length > L.unsupported ||
-    parseErrors.length > L.parseErrors ||
-    graph.cycles.length > L.cycles ||
-    graph.cycles.slice(0, L.cycles).some((c) => c.length - 1 > L.cycleFiles);
+    files.length < allFiles.length ||
+    edges.length < allEdges.length ||
+    keptUnresolved.length < unresolved.length ||
+    keptPackages.length < allPackages.length ||
+    keptUnsupported.length < unsupported.length ||
+    keptParseErrors.length < parseErrors.length ||
+    keptCycles.length < graph.cycles.length ||
+    keptCycles.some((c) => c.length - 1 > L.cycleFiles);
 
   return {
     version: PLANNING_CONTEXT_VERSION,
@@ -465,13 +521,13 @@ export function buildPlanningContext(input: {
       cycles: graph.cycles.length,
     },
     truncated,
-    files: allFiles.slice(0, L.files),
-    edges: allEdges.slice(0, L.edges),
-    unresolved: unresolved.slice(0, L.unresolved),
-    externalPackages: allPackages.slice(0, L.externalPackages),
-    unsupported: unsupported.slice(0, L.unsupported),
-    parseErrors: parseErrors.slice(0, L.parseErrors),
-    cycles: graph.cycles.slice(0, L.cycles),
+    files,
+    edges,
+    unresolved: keptUnresolved,
+    externalPackages: keptPackages,
+    unsupported: keptUnsupported,
+    parseErrors: keptParseErrors,
+    cycles: keptCycles,
     isAcyclic: graph.isAcyclic,
     coverage: (() => {
       const cov = scanCoverage(input.items, input.limitsReached ?? []);
@@ -486,7 +542,7 @@ export function buildPlanningContext(input: {
         ).length,
       };
     })(),
-    focus: input.requirement ? buildRequirementFocus(input.requirement, graph) : null,
+    focus: input.requirement ? buildRequirementFocus(input.requirement, graph, L) : null,
   };
 }
 
@@ -570,6 +626,11 @@ function renderCycle(cycle: readonly string[]): string {
   return `${shown.join(" -> ")} -> … (${files - shown.length} more files, then back to ${cycle[0]})`;
 }
 
+function renderBudget(b: ContextBudget): string {
+  const parts = b.reductions.map((r) => `${r.section} (${r.shown} of ${r.total} listed)`);
+  return `CONTEXT REDUCED TO FIT THE MODEL'S BUDGET: ${parts.join("; ")}. Anything not listed below was left out for space — it is NOT absent from the project, and its absence here is not evidence of anything. Totals in each heading are exact.`;
+}
+
 function renderCoverage(c: PlanningContext["coverage"]): string {
   const gaps = c.unreadDirectories - c.ignoredDirectories;
   const ignored = c.ignoredDirectories
@@ -594,6 +655,7 @@ export function renderPlanningContext(ctx: PlanningContext): string {
     "",
     renderCoverage(ctx.coverage),
     "",
+    ...(ctx.budget && ctx.budget.reductions.length > 0 ? [renderBudget(ctx.budget), ""] : []),
     ...(ctx.focus ? [...renderFocus(ctx.focus), ""] : []),
     `Files in the scan inventory (${shownOf(ctx.files.length, ctx.counts.files)}):`,
     ...(ctx.files.length ? ctx.files.map((f) => `- ${f}`) : ["- (none)"]),

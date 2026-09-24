@@ -14,10 +14,14 @@ import {
 import type { UpdatablePlanFields } from "../validators/aiPlan.validators.js";
 import { loadPlanGrounding, type PlanGrounding } from "./planContext.service.js";
 import {
+  buildPlanningContext,
   classifyAffectedFiles,
   renderPlanningContext,
   type AffectedFileEvidenceSource,
+  type PlanningContext,
 } from "../lib/planningContext.js";
+import { fitPlanningContext, FIT_SAFETY_MARGIN_TOKENS } from "../lib/contextFitting.js";
+import { estimatePromptTokens, maxPromptTokens } from "./ai/ollamaProvider.js";
 import { assertObservedFile } from "./impact.service.js";
 import {
   computeImpact,
@@ -63,18 +67,30 @@ function impactFor(grounding: PlanGrounding, file: string, bounds: { maxDepth: n
   return computeImpact(grounding.graph, file, bounds);
 }
 
-function sourceContextFor(grounding: PlanGrounding, impact: ImpactResult | null) {
+/** Files an impact target makes most relevant — kept first if the context must be cut. */
+function impactPriority(impact: ImpactResult): Set<string> {
+  return new Set([
+    impact.file,
+    ...impact.directDependencies.map((d) => d.file),
+    ...impact.directDependents.map((d) => d.file),
+    ...impact.transitiveDependents.map((d) => d.file),
+  ]);
+}
+
+/** `context` is the context the model was actually shown (possibly budget-fitted). */
+function sourceContextFor(grounding: PlanGrounding, context: PlanningContext, impact: ImpactResult | null) {
   return {
     scan: grounding.scan._id,
     analysis: grounding.analysis._id,
     scanCreatedAt: grounding.scan.get("createdAt") as Date | undefined,
     analysisCreatedAt: grounding.analysis.get("createdAt") as Date | undefined,
-    contextVersion: grounding.context.version,
-    truncated: grounding.context.truncated,
-    counts: grounding.context.counts,
-    coverage: grounding.context.coverage,
-    focusTerms: grounding.context.focus?.terms ?? [],
-    focusFiles: grounding.context.focus?.files.map((f) => f.path) ?? [],
+    contextVersion: context.version,
+    truncated: context.truncated,
+    counts: context.counts,
+    coverage: context.coverage,
+    focusTerms: context.focus?.terms ?? [],
+    focusFiles: context.focus?.files.map((f) => f.path) ?? [],
+    fitting: context.budget ?? null,
     impact: impact
       ? {
           file: impact.file,
@@ -118,19 +134,51 @@ export async function generatePlan(
     throw new AppError("impactFile requires scanId", 400);
   }
   const impact = grounding && impactFile ? impactFor(grounding, impactFile, IMPACT_PLANNING_BOUNDS) : null;
-  let projectEvidence: string | undefined;
+  const promptFor = (projectEvidence: string | undefined) =>
+    buildPlanningPrompt({
+      projectName: project.name,
+      requirementTitle: requirement.title,
+      requirementDescription: requirement.description,
+      projectEvidence,
+    });
+
+  // Stage 12 (ADR-027): a grounded prompt is fitted to the model's budget
+  // deterministically; if even the minimum safe context can't fit, refuse
+  // here — before any AI call — rather than truncate silently.
+  let prompt: string;
+  let shownContext: PlanningContext | null = null;
   if (grounding) {
     const categories = new Map(grounding.graph.nodes.map((n) => [n.id, n.category]));
-    projectEvidence = renderPlanningContext(grounding.context);
-    if (impact) projectEvidence += `\n\n${renderImpactForPrompt(impact, (f) => categories.get(f))}`;
+    const impactText = impact ? renderImpactForPrompt(impact, (f) => categories.get(f)) : "";
+    const budgetTokens = maxPromptTokens(env.OLLAMA_NUM_CTX) - FIT_SAFETY_MARGIN_TOKENS;
+    const fit = fitPlanningContext({
+      build: (limits, priorityFiles) =>
+        buildPlanningContext({
+          scanId: grounding.scan._id.toString(),
+          analysisId: grounding.analysis._id.toString(),
+          items: grounding.scan.items,
+          graph: grounding.graph,
+          requirement: { title: requirement.title, description: requirement.description },
+          limitsReached: grounding.scan.summary?.limitsReached ?? [],
+          limits,
+          priorityFiles,
+        }),
+      render: (ctx) => promptFor(`${renderPlanningContext(ctx)}${impactText ? `\n\n${impactText}` : ""}`),
+      estimateTokens: estimatePromptTokens,
+      budgetTokens,
+      priorityFiles: impact ? impactPriority(impact) : undefined,
+    });
+    if (!fit.fits) {
+      throw new AppError(
+        `Even the smallest safe planning context (~${fit.budget.estimatedTokensAfter} tokens, estimated) exceeds the prompt budget (${budgetTokens} tokens) for OLLAMA_NUM_CTX=${env.OLLAMA_NUM_CTX}. Increase OLLAMA_NUM_CTX, shorten the requirement, or plan without scan grounding.`,
+        422,
+      );
+    }
+    prompt = fit.prompt;
+    shownContext = fit.context;
+  } else {
+    prompt = promptFor(undefined);
   }
-
-  const prompt = buildPlanningPrompt({
-    projectName: project.name,
-    requirementTitle: requirement.title,
-    requirementDescription: requirement.description,
-    projectEvidence,
-  });
 
   const provider = getAIProvider();
   const startedAt = Date.now();
@@ -197,7 +245,7 @@ export async function generatePlan(
       grounding ? evidenceSourceFor(grounding, impact) : null,
     ),
     suggestedOrder: validation.suggestedOrder,
-    sourceContext: grounding ? sourceContextFor(grounding, impact) : null,
+    sourceContext: grounding && shownContext ? sourceContextFor(grounding, shownContext, impact) : null,
     validation: { valid: true, errors: [] },
     aiMeta: {
       provider: env.AI_PROVIDER,

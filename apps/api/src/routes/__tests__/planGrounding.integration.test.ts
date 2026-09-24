@@ -192,8 +192,10 @@ describe.skipIf(!dbAvailable)("Scan-grounded plan generation (real MongoDB, mock
     expect(plan.sourceContext).toMatchObject({
       scan: scanId,
       analysis: analysisId,
-      contextVersion: 3,
+      contextVersion: 4,
       truncated: false,
+      // A small project fits whole: the fitting record is kept, with nothing reduced.
+      fitting: { steps: [], reductions: [] },
       counts: { files: 3, graphNodes: 2, confirmedEdges: 1, unresolved: 1, external: 1, unsupported: 1 },
       // Requirement "Add caching" matches no path in this fixture.
       focusTerms: ["cach"],

@@ -101,7 +101,7 @@ describe("externalPackageName", () => {
 describe("buildPlanningContext", () => {
   it("records scan/analysis identity and exact counts per category", () => {
     const ctx = contextFor();
-    expect(ctx).toMatchObject({ scanId: "scan1", analysisId: "an1", version: 3, truncated: false });
+    expect(ctx).toMatchObject({ scanId: "scan1", analysisId: "an1", version: 4, truncated: false });
     expect(ctx.counts).toEqual({
       files: 4,
       graphNodes: 3,

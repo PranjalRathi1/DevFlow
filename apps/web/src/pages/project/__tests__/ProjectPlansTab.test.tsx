@@ -509,6 +509,50 @@ describe("ProjectPlansTab", () => {
       expect(dialog.queryByText(/must change/i)).not.toBeInTheDocument();
     });
 
+    it("shows when the AI's context was reduced to fit its budget, and that omitted is not absent", async () => {
+      const dialog = await openReview(
+        planWith(
+          {
+            ...baseContext,
+            fitting: {
+              budgetTokens: 12032,
+              estimatedTokensBefore: 24000,
+              estimatedTokensAfter: 11800,
+              steps: ["files:100", "externalPackages:20", "edges:200"],
+              reductions: [
+                { section: "files", shown: 100, total: 2000 },
+                { section: "confirmed dependencies", shown: 200, total: 6000 },
+              ],
+            },
+          },
+          [],
+        ),
+      );
+      const note = dialog.getByText(/some evidence lists were shortened/i);
+      expect(note).toHaveTextContent("files (100 of 2000), confirmed dependencies (200 of 6000)");
+      expect(note).toHaveTextContent(/not absent from the project/);
+    });
+
+    it("says nothing about reduction when the full context fit", async () => {
+      const dialog = await openReview(
+        planWith(
+          {
+            ...baseContext,
+            fitting: {
+              budgetTokens: 12032,
+              estimatedTokensBefore: 5000,
+              estimatedTokensAfter: 5000,
+              steps: [],
+              reductions: [],
+            },
+          },
+          [],
+        ),
+      );
+      await dialog.findByText(/grounded in scan/i);
+      expect(dialog.queryByText(/some evidence lists were shortened/i)).not.toBeInTheDocument();
+    });
+
     it("explains every label, including that unverified is not absent", async () => {
       const dialog = await openReview(planWith(baseContext, []));
       const legend = dialog.getByText(/file labels are checked by devflow/i);

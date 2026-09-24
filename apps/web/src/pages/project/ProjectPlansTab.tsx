@@ -63,6 +63,13 @@ function PlanEvidenceSummary({ plan, latestScanId }: { plan: Plan; latestScanId:
       {ctx.truncated && (
         <p className="mt-1">Some evidence lists were truncated for the AI; the totals above are exact.</p>
       )}
+      {ctx.fitting && ctx.fitting.reductions.length > 0 && (
+        <p className="mt-1 text-warning-800">
+          To fit the AI model&apos;s context budget, some evidence lists were shortened:{" "}
+          {ctx.fitting.reductions.map((r) => `${r.section} (${r.shown} of ${r.total})`).join(", ")}. Items
+          left out were not shown to the AI — they are not absent from the project.
+        </p>
+      )}
       {cov && (cov.stoppedEarly.length > 0 || coverageGaps > 0) && (
         <p className="mt-1 text-warning-800">
           The scan was incomplete

@@ -40,6 +40,14 @@ export interface PlanSourceContext {
   // C5.1 — absent on older plans.
   focusTerms?: string[];
   focusFiles?: string[];
+  // Stage 12 — how the context was fitted to the model's budget; absent on older plans.
+  fitting?: {
+    budgetTokens: number;
+    estimatedTokensBefore: number;
+    estimatedTokensAfter: number;
+    steps: string[];
+    reductions: { section: string; shown: number; total: number }[];
+  };
   // Stage 5 / Stage 4 — absent on older plans.
   coverage?: { stoppedEarly: string[]; unreadDirectories: number; ignoredDirectories: number };
   impact?: {

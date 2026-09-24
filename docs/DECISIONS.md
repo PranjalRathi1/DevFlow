@@ -1349,3 +1349,61 @@ dropped evidence at approval. Between 4 and 7 tests failed for each.
    its counts stay exact.
 3. **AI-authored testing approach shown unlabelled (low).** It is now
    labelled as the AI's, like the rationale and reasons.
+
+## ADR-027: Deterministic context-budget fitting (Stage 12)
+
+**Problem (ADR-025)**: at the context caps, a large project's grounded
+prompt is about 24k estimated tokens against a 12,032-token fitting budget
+(`OLLAMA_NUM_CTX` 16384, minus 4096 reserved for output, minus a
+256-token safety margin). Such projects always got a 422.
+
+**Decision**: `lib/contextFitting.ts` (pure). If the full context doesn't
+fit, it applies `FITTING_STEPS` cumulatively and in order (the lower cap
+always wins), re-rendering the whole prompt and re-estimating after each
+step, and stops at the first fit. The order is the policy, least necessary
+first:
+
+1. the flat file inventory
+2. external package names
+3. confirmed edges
+4. diagnostic item lists (unresolved, unsupported, parse errors)
+5. cycles
+6. focus-file detail
+7. focus files and cycles (last)
+
+These are **never** shortened: the requirement, rules and output schema,
+scan coverage, every section heading with its exact total (so confirmed,
+unresolved, external, unsupported and parse-error stay distinct and
+counted), at least 6 focus files, and the user's impact section. When
+even that minimum doesn't fit, generation returns 422 before any AI call.
+The provider's ADR-020 guard remains the final boundary.
+
+When a list must be cut, items touching the focus files (their importers,
+imports and reaching tests) or the impact target and its relations are
+kept first. The kept items are shown in their normal sorted order, so the
+output doesn't depend on input order. Without a reduction the context is
+byte-identical to an unfitted one.
+
+**Observability**: the prompt carries a "CONTEXT REDUCED TO FIT THE MODEL'S
+BUDGET" line listing each shortened section as "shown of total". It says
+that omitted items are _left out for space, not absent_, and that absence
+is not evidence. `sourceContext.fitting` stores the budget, the estimates
+before and after, the steps and the reductions, and the review UI shows
+the same. Context version is now 4.
+
+**Measured**:
+
+- Synthetic worst case (2,000 files, 6,000 edges): 24,011 → 11,079
+  estimated tokens in 6 steps and 146 ms. Files shown 40 of 2,000,
+  confirmed dependencies 100 of 6,000, unresolved 20 of 80.
+- Real `node_modules/mongodb` (400 files, 1,789 edges): 12,231 → 9,956
+  after one step (files 100 of 400). A real qwen2.5:7b generation returned
+  201 in 22.7 s; Ollama counted 8,621 prompt tokens (the estimate is about
+  15% conservative), with no truncation and 0 label mismatches. The
+  scanned tree was byte-identical afterwards.
+- DevFlow's own backend still fits with no reduction.
+
+_Alternatives rejected_: raising `OLLAMA_NUM_CTX` automatically (a
+resource cost that must be chosen explicitly); dropping whole sections,
+which would lose the category distinctions and totals; and
+relevance-by-embedding, which adds a dependency and isn't deterministic.
