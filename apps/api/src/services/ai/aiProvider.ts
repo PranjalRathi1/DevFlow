@@ -11,7 +11,9 @@ export interface AIProvider {
   checkAvailability(): Promise<boolean>;
 }
 
-export type AIProviderErrorCode = "unavailable" | "timeout" | "invalid_response";
+// "context_overflow": the prompt was NOT sent because it cannot fit the
+// configured context window (see ollamaProvider.ts) — never silently truncated.
+export type AIProviderErrorCode = "unavailable" | "timeout" | "invalid_response" | "context_overflow";
 
 export class AIProviderError extends Error {
   readonly code: AIProviderErrorCode;

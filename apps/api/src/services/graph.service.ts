@@ -1,4 +1,5 @@
-import { Analysis } from "../models/Analysis.js";
+import { Analysis, type AnalysisDocument } from "../models/Analysis.js";
+import type { ScanDocument } from "../models/Scan.js";
 import { getScanForOwner } from "./scan.service.js";
 import {
   buildDependencyGraph,
@@ -39,6 +40,19 @@ export async function getDependencyGraphForOwner(
     throw new AppError("No analysis has been run for this scan yet", 404);
   }
 
+  return buildScanDependencyGraph(scan, analysis);
+}
+
+/**
+ * The pure graph-building half of `getDependencyGraphForOwner`, for callers
+ * that already loaded (and ownership-checked) the scan and a specific
+ * analysis of it — e.g. Batch C5 planning. The caller MUST pass an
+ * analysis whose `scan` is this scan.
+ */
+export function buildScanDependencyGraph(
+  scan: ScanDocument,
+  analysis: AnalysisDocument,
+): ScanDependencyGraph {
   // Converted to plain objects at this boundary — the pure graph engine
   // takes only plain data, never a Mongoose subdocument type.
   const relationships: GraphRelationshipInput[] = analysis.relationships.map((r) => ({

@@ -12,6 +12,12 @@ import {
   type SuggestedTask,
 } from "../validators/aiPlan.validators.js";
 import type { UpdatablePlanFields } from "../validators/aiPlan.validators.js";
+import { loadPlanGrounding, type PlanGrounding } from "./planContext.service.js";
+import {
+  classifyAffectedFiles,
+  renderPlanningContext,
+  type AffectedFileEvidenceSource,
+} from "../lib/planningContext.js";
 import { env } from "../config/env.js";
 import { logger } from "../utils/logger.js";
 
@@ -25,6 +31,27 @@ async function getOwnedRequirementInProject(ownerId: string, projectId: string, 
 }
 
 /**
+ * Attaches server-computed evidence to each task's AI-proposed files.
+ * The AI (or a human edit) supplies only `path`/`reason`; whether that
+ * path exists in the scan is decided here, never trusted from input.
+ */
+function withFileEvidence(tasks: SuggestedTask[], source: AffectedFileEvidenceSource | null) {
+  return tasks.map((task) => ({ ...task, affectedFiles: classifyAffectedFiles(task.affectedFiles, source) }));
+}
+
+function sourceContextFor(grounding: PlanGrounding) {
+  return {
+    scan: grounding.scan._id,
+    analysis: grounding.analysis._id,
+    scanCreatedAt: grounding.scan.get("createdAt") as Date | undefined,
+    analysisCreatedAt: grounding.analysis.get("createdAt") as Date | undefined,
+    contextVersion: grounding.context.version,
+    truncated: grounding.context.truncated,
+    counts: grounding.context.counts,
+  };
+}
+
+/**
  * The full generate workflow: auth/ownership are the caller's
  * responsibility (controller), everything else — prompting, parsing,
  * validating, and persisting only if valid — happens here. Never saves an
@@ -34,14 +61,19 @@ export async function generatePlan(
   ownerId: string,
   projectId: string,
   requirementId: string,
+  scanId?: string,
 ): Promise<PlanDocument> {
   const project = await getProjectForOwner(ownerId, projectId);
   const requirement = await getOwnedRequirementInProject(ownerId, projectId, requirementId);
+  // Batch C5: resolved BEFORE calling the AI, so a bad/foreign/unanalyzed
+  // scan fails fast and never costs a model call.
+  const grounding = scanId ? await loadPlanGrounding(ownerId, projectId, scanId) : null;
 
   const prompt = buildPlanningPrompt({
     projectName: project.name,
     requirementTitle: requirement.title,
     requirementDescription: requirement.description,
+    projectEvidence: grounding ? renderPlanningContext(grounding.context) : undefined,
   });
 
   const provider = getAIProvider();
@@ -51,6 +83,14 @@ export async function generatePlan(
     raw = await provider.complete(prompt);
   } catch (err) {
     if (err instanceof AIProviderError) {
+      if (err.code === "context_overflow") {
+        // Not a provider outage: this request's evidence is too large for
+        // the configured OLLAMA_NUM_CTX. Nothing was sent to the model.
+        throw new AppError(
+          "The planning context is too large for the AI model's configured context window (OLLAMA_NUM_CTX). Increase it, or generate the plan without scan grounding.",
+          422,
+        );
+      }
       const status = err.code === "invalid_response" ? 502 : 503;
       throw new AppError(
         err.code === "timeout"
@@ -96,8 +136,9 @@ export async function generatePlan(
     summary: plan.summary,
     assumptions: plan.assumptions,
     risks: plan.risks,
-    suggestedTasks: plan.suggestedTasks,
+    suggestedTasks: withFileEvidence(plan.suggestedTasks, grounding?.evidenceSource ?? null),
     suggestedOrder: validation.suggestedOrder,
+    sourceContext: grounding ? sourceContextFor(grounding) : null,
     validation: { valid: true, errors: [] },
     aiMeta: {
       provider: env.AI_PROVIDER,
@@ -150,7 +191,19 @@ export async function updatePlanForOwner(
         422,
       );
     }
-    updates.suggestedTasks = input.suggestedTasks;
+    // Re-checked against the SAME scan + analysis the plan was generated
+    // from, so an edit can't make a proposed file look verified.
+    let source: AffectedFileEvidenceSource | null = null;
+    if (plan.sourceContext) {
+      const grounding = await loadPlanGrounding(
+        ownerId,
+        plan.project.toString(),
+        plan.sourceContext.scan.toString(),
+        plan.sourceContext.analysis.toString(),
+      );
+      source = grounding.evidenceSource;
+    }
+    updates.suggestedTasks = withFileEvidence(input.suggestedTasks, source);
     updates.suggestedOrder = suggestedOrder;
   }
 

@@ -988,3 +988,89 @@ so a traversal like `../../secret.js` stays `unsupported` even when
 246 unresolved to 246 confirmed / 0 unresolved (all `nodenext:.js->.ts`).
 `apps/web/src` (Bundler resolution, extensionless imports) is identical
 before and after. `docs/TESTING.md` documents the new tests.
+
+## ADR-019: Evidence-backed AI planning (Batch C5)
+
+**Context**: Plans were generated from a requirement alone. C1–C4 produce
+verified project evidence (scan inventory, analysis, canonical graph) that
+the planner never saw.
+
+**1. Grounding is opt-in, per request, on the existing pipeline.**
+`POST /projects/:id/plans/generate` accepts an optional `scanId`. No new
+planning endpoint or service was added. Without it, behavior is the same
+as before C5 (the prompt now says outright that no codebase evidence
+exists).
+
+**2. Evidence comes only from stored data.** `services/planContext.service.ts`
+checks that the scan belongs to the owner and to this project (404
+otherwise, including cross-project), rejects failed scans, and requires a
+successful analysis (409) before any AI call. It builds the graph with
+the same `buildScanDependencyGraph` the Graph API uses. There is no
+filesystem access, no re-scan, and no re-analysis.
+
+**3. The context is bounded and deterministic.** `lib/planningContext.ts`
+renders sorted lists (files, confirmed edges with their first-located
+evidence, unresolved, external packages, unsupported, parse errors,
+proven cycles), capped per category (`PLANNING_CONTEXT_LIMITS`). Totals
+are always exact, and truncation is always stated. Non-confirmed
+categories are labeled in the prompt as not being dependencies. A cycle
+is mentioned only if the canonical graph proves it.
+
+**4. The server decides file existence.** The AI (or a human PATCH) can
+supply only `path` and `reason` for each affected file. Paths are
+normalized, and any absolute, drive-letter or `..` path fails validation
+(422, nothing persisted). `evidence` is computed against the scan's
+observed inventory, excluding symlink placeholders. An edit is re-checked
+against the plan's own pinned scan and analysis.
+
+**5. Traceability.** `Plan.sourceContext` stores the scan and analysis ids,
+their timestamps, the context version, the truncation flag, and exact
+counts. The raw prompt is still not stored (same policy as `aiMeta`).
+
+## ADR-020: Explicit Ollama context window and compact planning context (C5 fix)
+
+**Context**: The first real Ollama run of a scan-grounded plan (qwen2.5:7b,
+DevFlow's own `apps/api`) returned 503 after 60 s. Ollama's log showed
+`truncating input prompt limit=2050 prompt=6963`: DevFlow sent no
+`num_ctx`, so Ollama used its default of 4096 and kept only the prompt's
+first 4 and last 2046 tokens. The model never saw the requirement or the
+file list.
+
+**Measurement** (exact, using qwen2.5's own tokenizer via Ollama's
+`prompt_eval_count`): 6,934 raw tokens, of which confirmed edges were
+5,300 (76%) at about 26.5 tokens per edge line.
+
+**1. Compact edges.** Edges are now grouped by importer
+(`- a.ts -> b.ts:3, c.ts:7,12`). Every edge and every statement line is
+still listed. The raw specifier is no longer repeated in the prompt; it
+stays in the stored analysis evidence. This costs about 11 tokens per
+edge. The same repository's prompt now includes **all 266** edges in
+**4,565 tokens** (previously 200 of 266 in 6,934). The edge cap went from
+200 to 400, since 400 compact edges cost less than the old 200.
+`PLANNING_CONTEXT_VERSION` is now 2.
+
+**2. `OLLAMA_NUM_CTX` (default 16384, allowed 8192–131072).** It is sent as
+`options.num_ctx` on every call, together with
+`num_predict = MAX_OUTPUT_TOKENS` (4096), which is reserved out of the
+window. 16384 fits the measured prompt plus the output budget with room to
+spare, and costs about 0.9 GB of KV cache on a 7B model. The name was
+chosen instead of `OLLAMA_CONTEXT_LENGTH`, which is Ollama's own
+server-wide variable.
+
+**3. No silent truncation.** Before sending, the provider estimates the
+prompt at 3 chars per token (measured: 3.72–4.13). A prompt over
+`OLLAMA_NUM_CTX - 4096` is not sent: the error code is
+`context_overflow` and the HTTP status is 422, with a message naming
+`OLLAMA_NUM_CTX`. Other error mappings are unchanged.
+
+**4. `AI_REQUEST_TIMEOUT_MS` default 180000** (was 60000). A cold model load
+alone measured 22 s, and generation runs at about 49 tokens/s.
+
+**5. Diagnostics.** Timeout, failure and success logs include the model,
+`numCtx`, prompt characters, estimated tokens, elapsed time, and (on
+success) `prompt_eval_count`, `eval_count`, `done_reason` and the
+load/total durations. Prompt and response text are never logged.
+
+**Result**: re-validated with the real model. HTTP 201 in 24 s, a
+4,663-token prompt in a 16,384-token context, no truncation, 820 output
+tokens.

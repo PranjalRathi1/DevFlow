@@ -10,6 +10,49 @@ import { PRIORITIES } from "./Requirement.js";
 export const PLAN_STATUSES = ["needs_review", "approved", "rejected"] as const;
 export type PlanStatus = (typeof PLAN_STATUSES)[number];
 
+// Batch C5: which evidence backs a file the AI says a task touches. Set
+// by the server against the recorded scan (lib/planningContext.ts), never
+// taken from the AI. "unverified" = the plan was not grounded in a scan.
+export const AFFECTED_FILE_EVIDENCE = ["in_scan", "not_in_scan", "unverified"] as const;
+
+const affectedFileSchema = new Schema(
+  {
+    path: { type: String, required: true, trim: true, maxlength: 300 },
+    reason: { type: String, trim: true, maxlength: 500, default: "" },
+    evidence: { type: String, enum: AFFECTED_FILE_EVIDENCE, required: true },
+    // Confirmed-graph counts at generation time; only for in-scan source files.
+    dependentsCount: { type: Number },
+    dependenciesCount: { type: Number },
+  },
+  { _id: false },
+);
+
+// Batch C5: identity of the exact scan + analysis the planner was shown,
+// plus exact totals, so a reviewer can see what the plan is grounded in.
+// `null` for a plan generated without scan context.
+const sourceContextSchema = new Schema(
+  {
+    scan: { type: Schema.Types.ObjectId, ref: "Scan", required: true },
+    analysis: { type: Schema.Types.ObjectId, ref: "Analysis", required: true },
+    scanCreatedAt: { type: Date },
+    analysisCreatedAt: { type: Date },
+    contextVersion: { type: Number, required: true },
+    truncated: { type: Boolean, required: true },
+    counts: {
+      files: { type: Number, required: true },
+      graphNodes: { type: Number, required: true },
+      confirmedEdges: { type: Number, required: true },
+      unresolved: { type: Number, required: true },
+      external: { type: Number, required: true },
+      externalPackages: { type: Number, required: true },
+      unsupported: { type: Number, required: true },
+      parseErrors: { type: Number, required: true },
+      cycles: { type: Number, required: true },
+    },
+  },
+  { _id: false },
+);
+
 const suggestedTaskSchema = new Schema(
   {
     tempId: { type: String, required: true, trim: true, maxlength: 50 },
@@ -18,6 +61,8 @@ const suggestedTaskSchema = new Schema(
     acceptanceCriteria: { type: [String], default: [] },
     priority: { type: String, enum: PRIORITIES, default: "medium" },
     dependsOn: { type: [String], default: [] },
+    rationale: { type: String, trim: true, maxlength: 1000, default: "" },
+    affectedFiles: { type: [affectedFileSchema], default: [] },
   },
   { _id: false },
 );
@@ -34,6 +79,7 @@ const planSchema = new Schema(
     assumptions: { type: [String], default: [] },
     risks: { type: [String], default: [] },
     suggestedTasks: { type: [suggestedTaskSchema], default: [] },
+    sourceContext: { type: sourceContextSchema, default: null },
     // Computed by the dependency graph engine at generation time — never
     // trusted from the AI. Empty for an (impossible, since we never save
     // one) invalid plan.

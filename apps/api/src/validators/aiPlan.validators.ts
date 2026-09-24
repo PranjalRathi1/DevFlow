@@ -15,6 +15,38 @@ export const MAX_RAW_RESPONSE_CHARS = 100_000;
 
 const tempIdSchema = z.string().trim().min(1).max(MAX_TEMP_ID);
 
+const MAX_AFFECTED_FILES = 20;
+
+/**
+ * An AI-proposed project-relative path. Normalized (`\` -> `/`, leading
+ * `./` stripped) so it can be compared with scan inventory paths; an
+ * absolute, drive-letter, or `..`-climbing path is rejected outright
+ * rather than guessed into something else. Nothing here touches disk.
+ */
+export const proposedPathSchema = z
+  .string()
+  .trim()
+  .min(1)
+  .max(300)
+  .transform((p) => p.replace(/\\/g, "/").replace(/^(\.\/)+/, ""))
+  .refine(
+    (p) =>
+      p.length > 0 &&
+      !p.startsWith("/") &&
+      !/^[a-zA-Z]:/.test(p) &&
+      !p.includes("\0") &&
+      !p.split("/").some((segment) => segment === ".."),
+    { message: 'must be a project-relative path without ".." segments' },
+  );
+
+// Only path + reason are accepted from the AI (or a human edit). Whether a
+// file exists in the scan is computed server-side — an `evidence` field
+// supplied here is stripped by Zod, never trusted.
+const affectedFileInputSchema = z.object({
+  path: proposedPathSchema,
+  reason: z.string().trim().max(500).optional().default(""),
+});
+
 const suggestedTaskSchema = z.object({
   tempId: tempIdSchema,
   title: z.string().trim().min(1).max(200),
@@ -22,6 +54,8 @@ const suggestedTaskSchema = z.object({
   acceptanceCriteria: z.array(z.string().trim().min(1).max(500)).max(MAX_LIST_ITEMS).optional().default([]),
   priority: z.enum(PRIORITIES).optional().default("medium"),
   dependsOn: z.array(tempIdSchema).max(MAX_LIST_ITEMS).optional().default([]),
+  rationale: z.string().trim().max(1000).optional().default(""),
+  affectedFiles: z.array(affectedFileInputSchema).max(MAX_AFFECTED_FILES).optional().default([]),
 });
 
 export const aiPlanSchema = z.object({

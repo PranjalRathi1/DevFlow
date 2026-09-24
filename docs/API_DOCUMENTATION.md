@@ -235,14 +235,29 @@ for the full generation/validation/approval workflow.
 
 ### `POST /api/projects/:projectId/plans/generate`
 
-Request: `{ "requirementId": string }`.
+Request: `{ "requirementId": string, "scanId"?: string }`.
+
+With `scanId` (Batch C5), the plan is grounded in that scan and its latest
+dependency analysis. The prompt gets a bounded, deterministic summary of
+the recorded evidence, and the response carries `plan.sourceContext`
+(scan and analysis ids plus exact evidence counts). Each suggested task
+can have a `rationale` and `affectedFiles[]`. The server sets each file's
+`evidence`: `"in_scan"` (with `dependentsCount`/`dependenciesCount` for
+source files), `"not_in_scan"` (a proposed new file) or `"unverified"`
+(no `scanId`). An `evidence` value supplied by the AI or client is ignored.
 
 - `201` `{ "plan": {...} }` — status `"needs_review"`.
-- `400 VALIDATION_ERROR` — malformed `requirementId`.
-- `404` — project or requirement not found/not yours (requirement must
-  belong to `:projectId`).
-- `422` — the AI's output failed structural or graph validation (message
-  lists every issue found); **nothing is persisted**.
+- `400 VALIDATION_ERROR` — malformed `requirementId` or `scanId`.
+- `400` — the scan itself failed.
+- `404` — project, requirement, or scan not found/not yours (requirement
+  and scan must both belong to `:projectId`).
+- `409` — the scan has no (successful) dependency analysis yet. The AI
+  is not called.
+- `422` — the AI's output failed structural or graph validation, including
+  an absolute, drive-letter, or `..` file path (message lists every issue
+  found); **nothing is persisted**.
+- `422` — the prompt would not fit the configured model context
+  (`OLLAMA_NUM_CTX`). It is not sent to the model; nothing is persisted.
 - `502` — the provider's response wasn't valid JSON, or was too large to
   process.
 - `503` — the AI provider is unavailable or timed out.

@@ -24,7 +24,8 @@ export function usePlans(projectId: string) {
 export function useGeneratePlan(projectId: string) {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: (requirementId: string) => planService.generate(projectId, requirementId).then((r) => r.plan),
+    mutationFn: ({ requirementId, scanId }: { requirementId: string; scanId?: string | undefined }) =>
+      planService.generate(projectId, requirementId, scanId).then((r) => r.plan),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: ["plans", projectId] });
     },

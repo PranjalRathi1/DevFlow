@@ -115,3 +115,51 @@ describe("validateAIPlan", () => {
     expect(result.issues.length).toBeGreaterThan(0);
   });
 });
+
+describe("validateAIPlan — affected files and rationale (Batch C5)", () => {
+  function withFiles(affectedFiles: unknown) {
+    return validPlan({
+      suggestedTasks: [{ tempId: "t1", title: "Edit", dependsOn: [], rationale: "Because", affectedFiles }],
+    });
+  }
+
+  it("defaults rationale and affectedFiles for a pre-C5-shaped plan", () => {
+    const result = validateAIPlan(validPlan());
+    expect(result.plan?.suggestedTasks[0]).toMatchObject({ rationale: "", affectedFiles: [] });
+  });
+
+  it("normalizes backslashes and leading ./ in proposed paths", () => {
+    const result = validateAIPlan(withFiles([{ path: ".\\src\\a.ts" }, { path: "./src/b.ts", reason: "x" }]));
+    expect(result.valid).toBe(true);
+    expect(result.plan?.suggestedTasks[0]?.affectedFiles).toEqual([
+      { path: "src/a.ts", reason: "" },
+      { path: "src/b.ts", reason: "x" },
+    ]);
+  });
+
+  it.each([
+    ["/etc/passwd"],
+    ["C:/Windows/system.ini"],
+    ["c:\\x.ts"],
+    ["..\\outside.ts"],
+    ["../outside.ts"],
+    ["src/../../x.ts"],
+    [""],
+  ])("rejects an unsafe or empty path: %j", (p) => {
+    const result = validateAIPlan(withFiles([{ path: p }]));
+    expect(result.valid).toBe(false);
+    expect(result.issues.every((i) => i.type === "schema")).toBe(true);
+  });
+
+  it("strips an AI-supplied evidence claim — existence is computed server-side only", () => {
+    const result = validateAIPlan(
+      withFiles([{ path: "src/a.ts", evidence: "in_scan", dependentsCount: 99 }]),
+    );
+    expect(result.plan?.suggestedTasks[0]?.affectedFiles).toEqual([{ path: "src/a.ts", reason: "" }]);
+  });
+
+  it("caps affected files per task", () => {
+    const files = Array.from({ length: 21 }, (_, i) => ({ path: `f${i}.ts` }));
+    expect(validateAIPlan(withFiles(files)).valid).toBe(false);
+  });
+});

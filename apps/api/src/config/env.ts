@@ -30,7 +30,16 @@ const envSchema = z.object({
   AI_PROVIDER: z.enum(["ollama"]).default("ollama"),
   OLLAMA_BASE_URL: z.string().default("http://localhost:11434"),
   OLLAMA_MODEL: z.string().default("qwen2.5:7b"),
-  AI_REQUEST_TIMEOUT_MS: z.coerce.number().int().positive().default(60_000),
+  // Default raised from 60s (ADR-020): a real local qwen2.5:7b run spent
+  // 22s just loading the model, then generated at ~49 tokens/s.
+  AI_REQUEST_TIMEOUT_MS: z.coerce.number().int().positive().default(180_000),
+  // Context window (tokens) requested from Ollama on every call, as
+  // `options.num_ctx`. Without it Ollama used its own default (4096 on the
+  // validation machine) and silently truncated grounded prompts. 16384 fits
+  // the measured grounded prompt for DevFlow's own backend (~4.6k tokens)
+  // plus the reserved output budget with room to spare, and costs ~0.9 GB
+  // of KV cache for a 7B model. Must exceed the reserved output budget.
+  OLLAMA_NUM_CTX: z.coerce.number().int().min(8_192).max(131_072).default(16_384),
   // Read-only project scanner limits (Batch C1) — see
   // apps/api/src/services/scanner.service.ts and docs/DECISIONS.md.
   // Deliberately bounded defaults, not "large enough to make tests pass":

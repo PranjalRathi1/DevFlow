@@ -2,7 +2,7 @@ import type { BadgeTone } from "../components/ui/Badge";
 import type { ProjectStatus } from "../types/project";
 import type { RequirementStatus, Priority } from "../types/requirement";
 import type { TaskStatus } from "../types/task";
-import type { PlanStatus } from "../types/plan";
+import type { AffectedFileEvidence, PlanStatus } from "../types/plan";
 import type { ScanOutcome } from "../types/scan";
 import type { NonConfirmedStatus } from "../types/graph";
 
@@ -32,6 +32,12 @@ export const PLAN_STATUS_META: Record<PlanStatus, { label: string; tone: BadgeTo
   needs_review: { label: "Needs Review", tone: "warning" },
   approved: { label: "Approved", tone: "success" },
   rejected: { label: "Rejected", tone: "danger" },
+};
+
+export const AFFECTED_FILE_EVIDENCE_META: Record<AffectedFileEvidence, { label: string; tone: BadgeTone }> = {
+  in_scan: { label: "In scan", tone: "success" },
+  not_in_scan: { label: "Not in scan — proposed", tone: "warning" },
+  unverified: { label: "Unverified", tone: "neutral" },
 };
 
 export const SCAN_OUTCOME_META: Record<ScanOutcome, { label: string; tone: BadgeTone }> = {

@@ -18,7 +18,12 @@ function requireUserId(req: Request): string {
 }
 
 export async function generate(req: Request, res: Response): Promise<void> {
-  const plan = await generatePlan(requireUserId(req), req.params.projectId as string, req.body.requirementId);
+  const plan = await generatePlan(
+    requireUserId(req),
+    req.params.projectId as string,
+    req.body.requirementId,
+    req.body.scanId,
+  );
   res.status(201).json({ plan });
 }
 
