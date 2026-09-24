@@ -1,0 +1,27 @@
+services:
+  mongo:
+    image: mongo:7
+    container_name: devflow-mongo
+    restart: unless-stopped
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_ROOT_USERNAME:?set MONGO_ROOT_USERNAME in .env}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD:?set MONGO_ROOT_PASSWORD in .env}
+      MONGO_INITDB_DATABASE: ${MONGO_DB_NAME:-devflow}
+    ports:
+      # Bound to loopback only — not reachable from the LAN or the internet.
+      # This is a local-dev convenience; production deployments should use a
+      # managed MongoDB service (e.g. Atlas) reached over a private network,
+      # not a container port exposed on the host at all. See docs/SECURITY.md.
+      - "127.0.0.1:27017:27017"
+    volumes:
+      - mongo-data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+volumes:
+  mongo-data:
+    name: devflow-mongo-data
