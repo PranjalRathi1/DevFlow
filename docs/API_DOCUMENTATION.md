@@ -267,6 +267,25 @@ runtime usage.
   `maxNodes`; `nonConfirmedImports.totals` gives the exact counts.
 - `scanLimitsReached`: walk-stopping scan limits (e.g. `maxFiles`). If it
   isn't empty, dependents may be missing entirely.
+- Each dependent (direct or transitive) has `reach` (ADR-029):
+  `type_only` if every path to the file contains a syntactically type-only
+  import (`import type`, `export type … from`, `import("…")` types), so
+  the dependency is compile-time only; otherwise `runtime`, which means
+  _not proven type-only_. `onlyThroughReExports: true` marks a dependent
+  whose every path passes through an `export … from` edge (a barrel). It
+  may not use anything from the file, since symbols aren't analysed.
+- `dependentTotals` `{ all, runtime, typeOnly, onlyThroughReExports }`:
+  exact counts over every dependent at any depth, never cut by
+  `maxDepth`/`maxNodes`.
+- `affectedEntryPoints`: the file and its dependents that are entry points,
+  either declared in a package.json (`declaredBy`: exports/main/module/
+  types/bin, from the analysis) or imported by no analysed file
+  (`noImporters`: an app entry, a test, a script, or unused code). Each
+  has `depth` and `reach`, sorted by (depth, file) and capped at
+  `maxNodes`; `affectedEntryPointsTotal` is exact.
+  `packageEntryPointsRecorded: false` means the analysis predates ADR-029,
+  so only `noImporters` is known. Framework conventions (file-system
+  routes, config-loaded modules) are not detected.
 - `inGraph: false` for scanned files outside the analysed languages (e.g.
   `.css`): there is no import data for them, which is not the same as
   "no impact".
@@ -295,9 +314,45 @@ depth 6, 30 files) is added to the prompt, and `sourceContext.impact`
 records what the model was shown. Each in-scan affected file then gets a
 server-verified `impactRelation`: `target`, `dependency`,
 `direct_dependent`, `transitive_dependent`, or
-`dependency_and_dependent` (a cycle). Absent means the file was not found
+`dependency_and_dependent` (a cycle). `sourceContext.impact` also
+records `dependentsAtAnyDepth`, `typeOnlyDependents` and
+`entryPointsAffected` (ADR-029; absent on older plans). Absent means the file was not found
 within the bounded impact, which is _not_ the same as unrelated. An
 `impactRelation` supplied by the AI or a client is ignored.
+
+**Checked AI statements (ADR-030).** For a grounded plan, the server
+extracts two kinds of statement from the AI's free text: file paths, and
+present-tense import claims ("imported by src/app.ts", "a.ts imports
+b.ts"). It checks each against the plan's scan. It never marks a statement
+true or false.
+
+- `affectedFiles[].claimChecks` (from `reason`, at most 5) and
+  `suggestedTasks[].mentionedPaths` (from the description, rationale,
+  testing approach and acceptance criteria, at most 10) are
+  `{ kind, target, subject?, status, note? }`.
+  - `kind` is `imports`, `imported_by` or `mentions`.
+  - `status` is one of:
+    - `supported`: a confirmed import edge exists in the stated direction
+    - `not_found`: the scan shows no confirmed edge; the claim may still
+      hold through unresolved imports or runtime wiring
+    - `in_scan` / `not_in_scan`: whether a mentioned path exists
+    - `unverifiable`: a bare file name, a relative path, an unread
+      location or a non-source file
+  - A bare name with one candidate gets only a _conditional_ note ("if
+    this means …"); it is never resolved.
+  - Intent ("will import", "to use") and bare imperatives are recorded as
+    mentions, not claims. Prose like "Node.js" is ignored unless a scanned
+    file has that name.
+- `affectedFiles[].plannedBy`: a path the scan lacks that an _earlier_
+  task creates, meaning a task this one depends on, directly or
+  transitively. `modify`/`reference` on it is then consistent and not a
+  conflict; `evidence` stays `not_in_scan`. If the creator is not an
+  ancestor, or two tasks both create the path, `conflict` says so.
+- `sourceContext.resolution`: `{ aliasConfigs, localPackages,
+diagnosticsTotal, diagnostics }`, with at most 5 diagnostics.
+
+All of these are copied verbatim into `Task.planEvidence` on approval
+(`mentionedPaths` included) and are absent on older plans.
 
 C5.1 additions (all optional in AI output, so older plans stay valid):
 each suggested task can have a `testingApproach`; each affected file can
@@ -441,6 +496,17 @@ result.
   `status` (`confirmed` / `unresolved` / `external` / `unsupported` /
   `parse_error`) and evidence (importer, raw import string, line/column,
   resolution method where applicable).
+  - `resolutionMethod` names the whole chain, e.g.
+    `alias:@/* via apps/web/tsconfig.json; extension:.ts`,
+    `baseUrl via tsconfig.json; exact`,
+    `workspace:@acme/ui via packages/ui/package.json; exports["."] [types/import]; exact`,
+    `package-imports:#env via package.json [default]; exact` (ADR-028).
+  - `resolutionConfig` (analyses since ADR-028): `aliasScopes`
+    (`{dir, configFile, baseUrl, patterns, ambiguous}`), `packages`
+    (`{file, name, hasExports, hasImports}`), and `diagnostics`
+    (`{file, message}`: malformed config, package-based or out-of-root
+    `extends`, cycles, unsupported patterns). Each list is capped at 100.
+    Absent on older analyses.
 - `400` — the referenced scan itself has `outcome: "failed"` (nothing to
   analyze), or the project's configured source directory is no longer
   valid.
@@ -494,6 +560,6 @@ visualization of the Batch C3 canonical source-code dependency graph
 evidence-backed AI plan generation grounded in that graph (see
 `docs/PRODUCT_SCOPE_LOCAL.md`), paginated scan-inventory/analysis/graph
 retrieval (all three return their full bounded result in one response),
-Python (or any non-JS/TS/JSX/TSX) import extraction, alias/tsconfig-paths
-resolution, `node_modules` inspection. This document is updated as each
+Python (or any non-JS/TS/JSX/TSX) import extraction, `node_modules`
+inspection (and so package-based tsconfig `extends`). This document is updated as each
 lands; it does not describe endpoints that don't exist yet.

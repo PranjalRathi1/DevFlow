@@ -1,6 +1,6 @@
 import { Schema, model, type HydratedDocument, type InferSchemaType } from "mongoose";
 import { PRIORITIES, type Priority } from "./Requirement.js";
-import { affectedFileSchema } from "./Plan.js";
+import { affectedFileSchema, claimCheckSchema } from "./Plan.js";
 
 export { PRIORITIES };
 export type { Priority };
@@ -21,6 +21,7 @@ const planEvidenceSchema = new Schema(
     rationale: { type: String, default: "" },
     testingApproach: { type: String, default: "" },
     affectedFiles: { type: [affectedFileSchema], default: [] },
+    mentionedPaths: { type: [claimCheckSchema], default: undefined },
     sourceContext: {
       type: new Schema(
         {

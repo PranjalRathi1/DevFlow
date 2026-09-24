@@ -1,3 +1,4 @@
+import { CLAIM_CHECK_LIMITS, checkClaims, type ClaimCheck, type ClaimSource } from "./claimChecks.js";
 import type { ImpactRelation } from "./impactAnalysis.js";
 import {
   getTransitiveDependents,
@@ -713,6 +714,10 @@ export interface ClassifiedAffectedFile {
   evidenceNote?: string | undefined;
   dependentsCount?: number | undefined;
   dependenciesCount?: number | undefined;
+  /** Task 3: an earlier task this one depends on creates this path (set at plan level). */
+  plannedBy?: string | undefined;
+  /** Task 3: paths/import relationships the AI stated in `reason`, checked against the scan. */
+  claimChecks?: ClaimCheck[] | undefined;
 }
 
 export interface AffectedFileEvidenceSource {
@@ -722,6 +727,30 @@ export interface AffectedFileEvidenceSource {
   impactRelation?: ((path: string) => ImpactRelation | undefined) | undefined;
   /** Stage 5: what the scan could not have seen. Absent = treat the scan as complete (pre-Stage 5 behaviour). */
   coverage?: ScanCoverage | undefined;
+}
+
+/** Why a path absent from the inventory may still exist; undefined = the scan looked and it is absent. */
+function absenceNote(source: AffectedFileEvidenceSource, path: string): string | undefined {
+  if (source.inventory.has(path) || !source.coverage) return undefined;
+  const unread = unreadAncestor(source.coverage, path);
+  if (unread) {
+    return unread[0] === path
+      ? `This path is ${unread[1]}; its contents were not observed.`
+      : `Inside ${unread[0]}, ${unread[1]}; the scan did not look inside it.`;
+  }
+  if (source.coverage.stoppedEarly.length) {
+    return `The scan stopped early (${source.coverage.stoppedEarly.join(", ")}), so this path may exist but was not observed.`;
+  }
+  return undefined;
+}
+
+/** Task 3: the scan evidence free-text claims are checked against. */
+export function claimSourceFor(source: AffectedFileEvidenceSource): ClaimSource {
+  return {
+    inventory: source.inventory,
+    graph: source.graph,
+    absenceNote: (path) => absenceNote(source, path),
+  };
 }
 
 /**
@@ -741,6 +770,11 @@ export function classifyAffectedFiles(
   const seen = new Set<string>();
   const result: ClassifiedAffectedFile[] = [];
   const nodeIds = source ? new Set(source.graph.nodes.map((n) => n.id)) : null;
+  const claimSource = source ? claimSourceFor(source) : null;
+  const claimsOf = (path: string, reason: string) => {
+    const checks = claimSource ? checkClaims(reason, path, claimSource, CLAIM_CHECK_LIMITS.perFile) : [];
+    return checks.length ? { claimChecks: checks } : {};
+  };
 
   for (const file of files) {
     if (seen.has(file.path)) continue;
@@ -755,30 +789,15 @@ export function classifyAffectedFiles(
       continue;
     }
     // Absent from the inventory only proves absence where the scan looked.
-    const unread =
-      !source.inventory.has(file.path) && source.coverage
-        ? unreadAncestor(source.coverage, file.path)
-        : undefined;
-    if (unread) {
+    const note = absenceNote(source, file.path);
+    if (note) {
       result.push({
         path: file.path,
         reason,
         ...claim,
         evidence: "unverified",
-        evidenceNote:
-          unread[0] === file.path
-            ? `This path is ${unread[1]}; its contents were not observed.`
-            : `Inside ${unread[0]}, ${unread[1]}; the scan did not look inside it.`,
-      });
-      continue;
-    }
-    if (!source.inventory.has(file.path) && source.coverage?.stoppedEarly.length) {
-      result.push({
-        path: file.path,
-        reason,
-        ...claim,
-        evidence: "unverified",
-        evidenceNote: `The scan stopped early (${source.coverage.stoppedEarly.join(", ")}), so this path may exist but was not observed.`,
+        evidenceNote: note,
+        ...claimsOf(file.path, reason),
       });
       continue;
     }
@@ -795,6 +814,7 @@ export function classifyAffectedFiles(
           change === "modify" || change === "reference"
             ? `Claimed "${change}", but this path is not in the scan`
             : undefined,
+        ...claimsOf(file.path, reason),
       });
       continue;
     }
@@ -811,6 +831,7 @@ export function classifyAffectedFiles(
       ...(relation ? { impactRelation: relation } : {}),
       dependentsCount: isNode ? source.graph.edges.filter((e) => e.to === file.path).length : undefined,
       dependenciesCount: isNode ? source.graph.edges.filter((e) => e.from === file.path).length : undefined,
+      ...claimsOf(file.path, reason),
     });
   }
   return result;

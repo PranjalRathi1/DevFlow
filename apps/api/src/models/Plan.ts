@@ -2,6 +2,20 @@ import { Schema, model, type HydratedDocument, type InferSchemaType } from "mong
 import { PRIORITIES } from "./Requirement.js";
 import { AFFECTED_FILE_CHANGES } from "../validators/aiPlan.validators.js";
 import { IMPACT_RELATIONS } from "../lib/impactAnalysis.js";
+import { CLAIM_KINDS, CLAIM_STATUSES } from "../lib/claimChecks.js";
+
+// Task 3 (ADR-030): a free-text AI claim checked against the scan. Shared
+// by affected files and task-level mentions (and copied into Task.planEvidence).
+export const claimCheckSchema = new Schema(
+  {
+    kind: { type: String, enum: CLAIM_KINDS, required: true },
+    target: { type: String, required: true, maxlength: 300 },
+    subject: { type: String, maxlength: 300 },
+    status: { type: String, enum: CLAIM_STATUSES, required: true },
+    note: { type: String, maxlength: 400 },
+  },
+  { _id: false },
+);
 
 // Generation + structural/graph validation happen synchronously, in the
 // same request, before anything is persisted (see plan.service.ts) — an
@@ -39,6 +53,10 @@ export const affectedFileSchema = new Schema(
     impactRelation: { type: String, enum: IMPACT_RELATIONS },
     // Stage 5: why a grounded plan still can't verify this path.
     evidenceNote: { type: String, maxlength: 300 },
+    // Task 3: tempId of an earlier task (one this task depends on) that creates this path.
+    plannedBy: { type: String, maxlength: 50 },
+    // Task 3: paths / import relationships stated in `reason`, checked. Absent on older plans.
+    claimChecks: { type: [claimCheckSchema], default: undefined },
   },
   { _id: false },
 );
@@ -69,6 +87,23 @@ const sourceContextSchema = new Schema(
     },
     focusTerms: { type: [String], default: [] },
     focusFiles: { type: [String], default: [] },
+    // Task 3 (ADR-030): the import-resolution configuration behind the
+    // evidence (ADR-028). Absent on plans or analyses from before it existed.
+    resolution: {
+      type: new Schema(
+        {
+          aliasConfigs: { type: [String], default: [] },
+          localPackages: { type: Number, required: true },
+          diagnosticsTotal: { type: Number, required: true },
+          diagnostics: {
+            type: [new Schema({ file: String, message: String }, { _id: false })],
+            default: [],
+          },
+        },
+        { _id: false },
+      ),
+      default: undefined,
+    },
     // Stage 12 (ADR-027): how the context was fitted to the model's budget.
     // `steps` empty = the full context fit. Absent on older plans.
     fitting: {
@@ -107,6 +142,10 @@ const sourceContextSchema = new Schema(
           directDependencies: { type: Number, required: true },
           directDependents: { type: Number, required: true },
           transitiveDependentsShown: { type: Number, required: true },
+          // Task 2 (ADR-029): exact totals; absent on older plans.
+          dependentsAtAnyDepth: { type: Number },
+          typeOnlyDependents: { type: Number },
+          entryPointsAffected: { type: Number },
           truncated: { type: Boolean, required: true },
         },
         { _id: false },
@@ -140,6 +179,8 @@ const suggestedTaskSchema = new Schema(
     rationale: { type: String, trim: true, maxlength: 1000, default: "" },
     testingApproach: { type: String, trim: true, maxlength: 1000, default: "" },
     affectedFiles: { type: [affectedFileSchema], default: [] },
+    // Task 3: paths the task's own text names (not in affectedFiles), checked. Absent on older plans.
+    mentionedPaths: { type: [claimCheckSchema], default: undefined },
   },
   { _id: false },
 );

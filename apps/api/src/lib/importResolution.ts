@@ -1,4 +1,13 @@
 import path from "node:path";
+import {
+  EMPTY_RESOLUTION_CONFIG,
+  aliasScopeFor,
+  joinInRoot,
+  packageFor,
+  type AliasScope,
+  type LocalPackage,
+  type ResolutionConfig,
+} from "./resolutionConfig.js";
 
 /**
  * Deterministic module resolution against a known file inventory — no
@@ -78,10 +87,6 @@ function isRelativeSpecifier(rawImport: string): boolean {
   return rawImport.startsWith("./") || rawImport.startsWith("../");
 }
 
-function isAliasSpecifier(rawImport: string): boolean {
-  return ALIAS_PREFIXES.some((prefix) => rawImport.startsWith(prefix)) || rawImport.startsWith("/");
-}
-
 /**
  * Joins an importer's directory with a relative specifier using POSIX path
  * math (inventory paths are always "/"-separated) and normalizes `.`/`..`
@@ -103,9 +108,10 @@ export function resolveImport(
   importerRelativePath: string,
   rawImport: string,
   inventory: ScanInventoryIndex,
+  config: ResolutionConfig = EMPTY_RESOLUTION_CONFIG,
 ): ResolvedImport {
-  if (isAliasSpecifier(rawImport)) {
-    return { status: "unsupported", reason: "Alias/absolute import resolution is not implemented" };
+  if (rawImport.startsWith("/")) {
+    return { status: "unsupported", reason: "Absolute import paths are not resolved" };
   }
 
   // Stage 5: ".\\foo" used to fall through to "external package". It is a
@@ -118,21 +124,68 @@ export function resolveImport(
     };
   }
 
-  if (!isRelativeSpecifier(rawImport)) {
-    // Bare specifier: "react", "express", "@scope/package" — an external
-    // package reference, never treated as a local source file edge.
-    return { status: "external", reason: "Bare package specifier, classified as an external dependency" };
+  const importerIsTs = TYPESCRIPT_IMPORTER_EXTENSIONS.has(path.posix.extname(importerRelativePath));
+
+  if (isRelativeSpecifier(rawImport)) {
+    const candidate = resolveRelativeCandidate(importerRelativePath, rawImport);
+    if (candidate === null) {
+      return { status: "unsupported", reason: "Import target resolves outside the scanned source root" };
+    }
+    return resolveFileCandidate(
+      candidate,
+      { directoryOnly: rawImport.endsWith("/"), importerIsTs },
+      inventory,
+    );
   }
 
-  const normalizedCandidate = resolveRelativeCandidate(importerRelativePath, rawImport);
-  if (normalizedCandidate === null) {
-    return { status: "unsupported", reason: "Import target resolves outside the scanned source root" };
+  // ---- Non-relative specifiers (Task 1, ADR-028). Order follows
+  // TypeScript/Node: package "#imports", then tsconfig `paths`, then
+  // `baseUrl`, then local workspace packages, else external.
+  if (rawImport.startsWith("#")) {
+    return resolvePackageImports(importerRelativePath, rawImport, importerIsTs, inventory, config);
   }
 
+  const scope = aliasScopeFor(config, importerRelativePath);
+  if (scope) {
+    const viaPaths = resolveViaPaths(scope, rawImport, importerIsTs, inventory);
+    if (viaPaths) return viaPaths;
+    if (scope.baseUrl !== undefined) {
+      const viaBaseUrl = resolveViaBaseUrl(scope, rawImport, importerIsTs, inventory);
+      if (viaBaseUrl) return viaBaseUrl;
+    }
+  }
+
+  const workspace = resolveWorkspacePackage(rawImport, importerIsTs, inventory, config);
+  if (workspace) return workspace;
+
+  if (ALIAS_PREFIXES.some((prefix) => rawImport.startsWith(prefix))) {
+    return {
+      status: "unsupported",
+      reason:
+        "No path alias matching this import is configured (tsconfig/jsconfig paths); the alias is not resolved",
+    };
+  }
+
+  // Bare specifier: "react", "express", "@scope/package" — an external
+  // package reference, never treated as a local source file edge.
+  return { status: "external", reason: "Bare package specifier, classified as an external dependency" };
+}
+
+/**
+ * Resolves one scan-relative candidate path with the rules every import
+ * kind shares: explicit-extension checks, NodeNext `.js`/`.jsx` mapping
+ * (TypeScript importers only, ambiguity = unresolved), exact match,
+ * extension appending, index files, and the case-mismatch diagnostic.
+ */
+function resolveFileCandidate(
+  candidate: string,
+  opts: { directoryOnly: boolean; importerIsTs: boolean },
+  inventory: ScanInventoryIndex,
+): ResolvedImport {
   // Stage 5: a trailing slash names a DIRECTORY ("./lib/"), so only index
   // resolution applies — never a file named "lib" or "lib.ts".
-  if (rawImport.endsWith("/")) {
-    const dir = normalizedCandidate.replace(/\/+$/, "");
+  if (opts.directoryOnly) {
+    const dir = candidate.replace(/\/+$/, "");
     const index = inventory.directories.has(dir) ? resolveIndex(dir, inventory) : undefined;
     if (index) return index;
     return {
@@ -142,7 +195,6 @@ export function resolveImport(
         : "Specifier names a directory (trailing slash) that is not in the scanned inventory",
     };
   }
-  const candidate = normalizedCandidate;
 
   const explicitExt = path.posix.extname(candidate);
   if (explicitExt && !SUPPORTED_EXPLICIT_EXTENSIONS.has(explicitExt)) {
@@ -162,7 +214,7 @@ export function resolveImport(
   if (nodeNextSources) {
     const base = candidate.slice(0, -explicitExt.length);
     const mapped = nodeNextSources.map((ext) => ({ ext, path: `${base}${ext}` }));
-    if (TYPESCRIPT_IMPORTER_EXTENSIONS.has(path.posix.extname(importerRelativePath))) {
+    if (opts.importerIsTs) {
       const matches = [candidate, ...mapped.map((m) => m.path)].filter((p) => inventory.files.has(p));
       if (matches.length > 1) {
         return {
@@ -227,6 +279,365 @@ export function resolveImport(
   };
 }
 
+const isAmbiguity = (r: ResolvedImport) => r.status === "unresolved" && /Ambiguous/.test(r.reason ?? "");
+
+/** Prefixes a confirmed inner resolution with how the candidate was derived. */
+function via(outer: string, inner: ResolvedImport): ResolvedImport {
+  return { ...inner, resolutionMethod: `${outer}; ${inner.resolutionMethod}` };
+}
+
+/**
+ * TypeScript's `paths` matching: an exact (star-less) key wins; otherwise
+ * the wildcard key with the longest prefix (first such key on ties,
+ * config order). Returns the substitutions with "*" filled in.
+ */
+function matchPattern(
+  patterns: readonly { pattern: string; targets: readonly string[] }[],
+  specifier: string,
+): { pattern: string; substitutions: string[] } | undefined {
+  const exact = patterns.find((p) => !p.pattern.includes("*") && p.pattern === specifier);
+  if (exact) return { pattern: exact.pattern, substitutions: [...exact.targets] };
+  let best: { pattern: string; targets: readonly string[]; captured: string; prefix: number } | undefined;
+  for (const p of patterns) {
+    const star = p.pattern.indexOf("*");
+    if (star < 0) continue;
+    const prefix = p.pattern.slice(0, star);
+    const suffix = p.pattern.slice(star + 1);
+    if (
+      specifier.length >= prefix.length + suffix.length &&
+      specifier.startsWith(prefix) &&
+      specifier.endsWith(suffix) &&
+      (!best || prefix.length > best.prefix)
+    ) {
+      best = {
+        pattern: p.pattern,
+        targets: p.targets,
+        captured: specifier.slice(prefix.length, specifier.length - suffix.length),
+        prefix: prefix.length,
+      };
+    }
+  }
+  if (!best) return undefined;
+  const captured = best.captured;
+  return { pattern: best.pattern, substitutions: best.targets.map((t) => t.replace("*", captured)) };
+}
+
+function resolveViaPaths(
+  scope: AliasScope,
+  rawImport: string,
+  importerIsTs: boolean,
+  inventory: ScanInventoryIndex,
+): ResolvedImport | undefined {
+  const match = matchPattern(scope.paths, rawImport);
+  if (!match) return undefined;
+  if (scope.ambiguous) {
+    return { status: "unresolved", reason: `Path alias "${match.pattern}" matched, but ${scope.ambiguous}` };
+  }
+  const tried: string[] = [];
+  const hints: string[] = [];
+  let outside = 0;
+  // Substitutions in config order; the first that resolves wins — exactly
+  // TypeScript's rule, which bundlers and tsconfig-paths also follow.
+  for (const sub of match.substitutions) {
+    const candidate = joinInRoot(scope.pathsBase, sub);
+    if (candidate === null) {
+      outside += 1;
+      continue;
+    }
+    tried.push(candidate);
+    const r = resolveFileCandidate(candidate, { directoryOnly: sub.endsWith("/"), importerIsTs }, inventory);
+    if (r.status === "confirmed") return via(`alias:${match.pattern} via ${scope.configFile}`, r);
+    if (isAmbiguity(r) || r.status === "unsupported") {
+      return { ...r, reason: `Path alias "${match.pattern}" (${scope.configFile}): ${r.reason}` };
+    }
+    if (r.reason?.includes("letter case")) hints.push(r.reason);
+  }
+  if (tried.length === 0 && outside > 0) {
+    return {
+      status: "unsupported",
+      reason: `Path alias "${match.pattern}" (${scope.configFile}) maps outside the scanned root`,
+    };
+  }
+  // A catch-all "*" pattern falls through to normal resolution, as in TS
+  // (e.g. "react" under "*": ["src/*"] is still an installed package).
+  if (match.pattern === "*") return undefined;
+  return {
+    status: "unresolved",
+    reason: `Path alias "${match.pattern}" (${scope.configFile}) matched but no target exists in the scan (tried: ${tried.join(", ")})${hints.length ? `. ${hints.join(" ")}` : ""}`,
+  };
+}
+
+function resolveViaBaseUrl(
+  scope: AliasScope,
+  rawImport: string,
+  importerIsTs: boolean,
+  inventory: ScanInventoryIndex,
+): ResolvedImport | undefined {
+  const candidate = joinInRoot(scope.baseUrl ?? "", rawImport);
+  if (candidate === null) return undefined;
+  const r = resolveFileCandidate(
+    candidate,
+    { directoryOnly: rawImport.endsWith("/"), importerIsTs },
+    inventory,
+  );
+  if (r.status === "confirmed") return via(`baseUrl via ${scope.configFile}`, r);
+  if (isAmbiguity(r)) return { ...r, reason: `baseUrl (${scope.configFile}): ${r.reason}` };
+  // Not found under baseUrl: TypeScript continues to node_modules lookup.
+  return undefined;
+}
+
+/** "@scope/name/sub/path" -> { name: "@scope/name", subpath: "./sub/path" }. */
+function splitPackageSpecifier(spec: string): { name: string; subpath: string } | undefined {
+  const parts = spec.split("/");
+  const nameParts = spec.startsWith("@") ? 2 : 1;
+  if (parts.length < nameParts || parts.slice(0, nameParts).some((p) => p === "")) return undefined;
+  const rest = parts.slice(nameParts).join("/");
+  return { name: parts.slice(0, nameParts).join("/"), subpath: rest ? `./${rest}` : "." };
+}
+
+type TargetLeaf = { conditions: string; target: string };
+type TargetLookup =
+  | { kind: "leaves"; key: string; leaves: TargetLeaf[] }
+  | { kind: "none" }
+  | { kind: "excluded"; key: string }
+  | { kind: "unsupported"; reason: string };
+
+/** Flattens a conditional export/import value into (condition path, target) leaves, in declaration order. */
+function flattenTarget(
+  value: unknown,
+  captured: string | undefined,
+  conditions: string[] = [],
+): TargetLeaf[] | "null" | "array" {
+  if (value === null) return "null";
+  if (typeof value === "string") {
+    return [
+      {
+        conditions: conditions.join(".") || "default",
+        target: captured !== undefined ? value.replaceAll("*", captured) : value,
+      },
+    ];
+  }
+  if (Array.isArray(value)) return "array";
+  if (typeof value === "object") {
+    const out: TargetLeaf[] = [];
+    for (const [cond, v] of Object.entries(value as Record<string, unknown>)) {
+      const sub = flattenTarget(v, captured, [...conditions, cond]);
+      if (sub === "array") return "array";
+      if (sub !== "null") out.push(...sub);
+    }
+    return out;
+  }
+  return [];
+}
+
+/** Node's exports/imports map lookup (exact key, else single-"*" key with the longest prefix). */
+function lookupMap(map: unknown, key: string, keyPrefix: "." | "#"): TargetLookup {
+  if (map === undefined) return { kind: "none" };
+  let entries: Record<string, unknown>;
+  if (typeof map === "string" || Array.isArray(map) || map === null) {
+    if (keyPrefix !== "." || key !== ".") return { kind: "none" };
+    entries = { ".": map };
+  } else if (typeof map === "object") {
+    const keys = Object.keys(map as object);
+    const isSubpathMap = keys.some((k) => k.startsWith(keyPrefix));
+    if (isSubpathMap && keys.some((k) => !k.startsWith(keyPrefix))) {
+      return { kind: "unsupported", reason: `invalid map: mixes "${keyPrefix}" keys and condition keys` };
+    }
+    entries = isSubpathMap ? (map as Record<string, unknown>) : keyPrefix === "." ? { ".": map } : {};
+  } else {
+    return { kind: "none" };
+  }
+
+  let chosen: { key: string; value: unknown; captured?: string } | undefined;
+  if (key in entries) chosen = { key, value: entries[key] };
+  else {
+    let bestPrefix = -1;
+    for (const [k, v] of Object.entries(entries)) {
+      const star = k.indexOf("*");
+      if (star < 0 || k.indexOf("*", star + 1) >= 0) continue;
+      const prefix = k.slice(0, star);
+      const suffix = k.slice(star + 1);
+      if (
+        key.length >= k.length &&
+        key.startsWith(prefix) &&
+        key.endsWith(suffix) &&
+        prefix.length > bestPrefix
+      ) {
+        bestPrefix = prefix.length;
+        chosen = { key: k, value: v, captured: key.slice(prefix.length, key.length - suffix.length) };
+      }
+    }
+  }
+  if (!chosen) return { kind: "none" };
+  const leaves = flattenTarget(chosen.value, chosen.captured);
+  if (leaves === "null") return { kind: "excluded", key: chosen.key };
+  if (leaves === "array")
+    return { kind: "unsupported", reason: `fallback arrays in "${chosen.key}" are not supported` };
+  return { kind: "leaves", key: chosen.key, leaves };
+}
+
+/**
+ * Resolves map leaves inside one package directory. Confirmed only when
+ * every leaf that resolves in the scan resolves to the SAME file; leaves
+ * pointing to different files are a genuine ambiguity (different
+ * runtimes/conditions pick differently) and stay unresolved.
+ */
+function resolveLeaves(
+  pkg: LocalPackage,
+  leaves: readonly TargetLeaf[],
+  importerIsTs: boolean,
+  inventory: ScanInventoryIndex,
+  label: string,
+): ResolvedImport {
+  const found = new Map<string, { conditions: string[]; inner: ResolvedImport }>();
+  const notFound: string[] = [];
+  for (const leaf of leaves) {
+    if (!leaf.target.startsWith("./")) {
+      return {
+        status: "unsupported",
+        reason: `${label}: target "${leaf.target}" is not package-relative ("./...")`,
+      };
+    }
+    const candidate = joinInRoot(pkg.dir, leaf.target);
+    if (
+      candidate === null ||
+      (pkg.dir !== "" && candidate !== pkg.dir && !candidate.startsWith(`${pkg.dir}/`))
+    ) {
+      return {
+        status: "unsupported",
+        reason: `${label}: target "${leaf.target}" escapes the package directory`,
+      };
+    }
+    const r = resolveFileCandidate(
+      candidate,
+      { directoryOnly: leaf.target.endsWith("/"), importerIsTs },
+      inventory,
+    );
+    if (isAmbiguity(r)) return { ...r, reason: `${label}: ${r.reason}` };
+    if (r.status === "confirmed" && r.resolvedRelativePath) {
+      const entry = found.get(r.resolvedRelativePath) ?? { conditions: [], inner: r };
+      entry.conditions.push(leaf.conditions);
+      found.set(r.resolvedRelativePath, entry);
+    } else {
+      notFound.push(`${leaf.conditions}: ${leaf.target}`);
+    }
+  }
+  if (found.size > 1) {
+    const detail = [...found.entries()].map(([file, e]) => `${e.conditions.join("/")} -> ${file}`).join("; ");
+    return {
+      status: "unresolved",
+      reason: `${label}: conditions resolve to different files (${detail}); not picked`,
+    };
+  }
+  const only = [...found.values()][0];
+  if (!only) {
+    return {
+      status: "unresolved",
+      reason: `${label}: no target exists in the scan (${notFound.join(", ")}); it may point to build output`,
+    };
+  }
+  const coverage = notFound.length
+    ? ` (${leaves.length - notFound.length} of ${leaves.length} conditions found in scan)`
+    : "";
+  return via(`${label} [${only.conditions.join("/")}]${coverage}`, only.inner);
+}
+
+function resolvePackageImports(
+  importer: string,
+  rawImport: string,
+  importerIsTs: boolean,
+  inventory: ScanInventoryIndex,
+  config: ResolutionConfig,
+): ResolvedImport {
+  const pkg = packageFor(config, importer);
+  if (!pkg || pkg.imports === undefined) {
+    return {
+      status: "unresolved",
+      reason: `"${rawImport}" is a package import ("#"), but no enclosing package.json in the scan defines "imports"`,
+    };
+  }
+  const found = lookupMap(pkg.imports, rawImport, "#");
+  if (found.kind === "none") {
+    return { status: "unresolved", reason: `No "imports" entry in ${pkg.file} matches "${rawImport}"` };
+  }
+  if (found.kind === "excluded") {
+    return {
+      status: "unresolved",
+      reason: `"imports" entry "${found.key}" in ${pkg.file} is null (excluded)`,
+    };
+  }
+  if (found.kind === "unsupported") return { status: "unsupported", reason: `${pkg.file}: ${found.reason}` };
+  // A "#" import may map to an installed package rather than a local file.
+  if (found.leaves.every((l) => !l.target.startsWith("./") && !l.target.startsWith("/"))) {
+    return { status: "external", reason: `"imports" entry "${found.key}" in ${pkg.file} maps to a package` };
+  }
+  return resolveLeaves(
+    pkg,
+    found.leaves,
+    importerIsTs,
+    inventory,
+    `package-imports:${found.key} via ${pkg.file}`,
+  );
+}
+
+function resolveWorkspacePackage(
+  rawImport: string,
+  importerIsTs: boolean,
+  inventory: ScanInventoryIndex,
+  config: ResolutionConfig,
+): ResolvedImport | undefined {
+  const spec = splitPackageSpecifier(rawImport);
+  if (!spec) return undefined;
+  const candidates = config.packagesByName.get(spec.name);
+  if (!candidates || candidates.length === 0) return undefined;
+  if (candidates.length > 1) {
+    return {
+      status: "unresolved",
+      reason: `Several local packages are named "${spec.name}" (${candidates.map((p) => p.file).join(", ")}); not picked`,
+    };
+  }
+  const pkg = candidates[0]!;
+  const label = `workspace:${spec.name} via ${pkg.file}`;
+
+  if (pkg.exports !== undefined) {
+    // With "exports", ONLY exported subpaths are reachable (Node semantics).
+    const found = lookupMap(pkg.exports, spec.subpath, ".");
+    if (found.kind === "none") {
+      return { status: "unresolved", reason: `${label}: subpath "${spec.subpath}" is not exported` };
+    }
+    if (found.kind === "excluded") {
+      return {
+        status: "unresolved",
+        reason: `${label}: subpath "${found.key}" is excluded (null) in exports`,
+      };
+    }
+    if (found.kind === "unsupported") return { status: "unsupported", reason: `${label}: ${found.reason}` };
+    return resolveLeaves(pkg, found.leaves, importerIsTs, inventory, `${label}; exports["${found.key}"]`);
+  }
+
+  if (spec.subpath !== ".") {
+    const candidate = joinInRoot(pkg.dir, spec.subpath);
+    if (candidate === null)
+      return { status: "unsupported", reason: `${label}: subpath escapes the scanned root` };
+    const r = resolveFileCandidate(
+      candidate,
+      { directoryOnly: rawImport.endsWith("/"), importerIsTs },
+      inventory,
+    );
+    return r.status === "confirmed" ? via(label, r) : { ...r, reason: `${label}: ${r.reason}` };
+  }
+
+  // Package root without "exports": the entry fields, then an index file.
+  const fields = (["types", "module", "main"] as const)
+    .filter((f) => typeof pkg[f] === "string")
+    .map((f) => ({ conditions: f, target: pkg[f]!.startsWith("./") ? pkg[f]! : `./${pkg[f]!}` }));
+  if (fields.length > 0) return resolveLeaves(pkg, fields, importerIsTs, inventory, label);
+  const index = resolveIndex(pkg.dir, inventory);
+  return index
+    ? via(`${label}; no entry fields`, index)
+    : { status: "unresolved", reason: `${label}: no entry field and no index file in the scan` };
+}
+
 function resolveIndex(dir: string, inventory: ScanInventoryIndex): ResolvedImport | undefined {
   for (const indexName of INDEX_BASENAMES) {
     const indexPath = dir === "" ? indexName : `${dir}/${indexName}`;
@@ -256,4 +667,60 @@ function caseMismatch(
     ].map((c) => c.toLowerCase()),
   );
   return [...inventory.files].sort().find((f) => tried.has(f.toLowerCase()));
+}
+
+export interface PackageEntryPoint {
+  file: string;
+  /** Which package.json fields declare it, e.g. `exports["."] [import]`, `main`, `bin.cli`. */
+  fields: string[];
+}
+
+/**
+ * Task 2 (ADR-029): the in-scan files a package.json DECLARES as entry
+ * points — non-wildcard `exports` subpaths, `main`/`module`/`types`, and
+ * `bin` — resolved with the same file rules as imports (no NodeNext
+ * mapping: a declared `dist/x.js` is build output, not `src/x.ts`).
+ * Targets outside the package directory or missing from the scan produce
+ * nothing. Sorted by file; fields sorted.
+ */
+export function packageEntryPoints(pkg: LocalPackage, inventory: ScanInventoryIndex): PackageEntryPoint[] {
+  const declared: { field: string; target: string; strict: boolean }[] = [];
+  const e = pkg.exports;
+  if (e !== undefined && e !== null) {
+    const isSubpathMap =
+      typeof e === "object" && !Array.isArray(e) && Object.keys(e).some((k) => k.startsWith("."));
+    const entries: [string, unknown][] = isSubpathMap ? Object.entries(e as object) : [[".", e]];
+    for (const [key, value] of entries) {
+      if (key.includes("*")) continue;
+      const leaves = flattenTarget(value, undefined);
+      if (!Array.isArray(leaves)) continue;
+      for (const leaf of leaves) {
+        declared.push({ field: `exports["${key}"] [${leaf.conditions}]`, target: leaf.target, strict: true });
+      }
+    }
+  }
+  for (const f of ["main", "module", "types"] as const) {
+    const v = pkg[f];
+    if (typeof v === "string") declared.push({ field: f, target: v, strict: false });
+  }
+  if (typeof pkg.bin === "string") declared.push({ field: "bin", target: pkg.bin, strict: false });
+  else if (pkg.bin && typeof pkg.bin === "object" && !Array.isArray(pkg.bin)) {
+    for (const [name, v] of Object.entries(pkg.bin as Record<string, unknown>)) {
+      if (typeof v === "string") declared.push({ field: `bin.${name}`, target: v, strict: false });
+    }
+  }
+
+  const found = new Map<string, Set<string>>();
+  for (const { field, target, strict } of declared) {
+    if (strict && !target.startsWith("./")) continue;
+    const rel = target.startsWith("./") ? target : `./${target}`;
+    const candidate = joinInRoot(pkg.dir, rel);
+    if (candidate === null || (pkg.dir !== "" && !candidate.startsWith(`${pkg.dir}/`))) continue;
+    const r = resolveFileCandidate(candidate, { directoryOnly: false, importerIsTs: false }, inventory);
+    if (r.status !== "confirmed" || !r.resolvedRelativePath) continue;
+    found.set(r.resolvedRelativePath, (found.get(r.resolvedRelativePath) ?? new Set()).add(field));
+  }
+  return [...found.entries()]
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([file, fields]) => ({ file, fields: [...fields].sort((a, b) => a.localeCompare(b)) }));
 }

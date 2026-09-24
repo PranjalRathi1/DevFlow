@@ -9,7 +9,20 @@ import {
 import { getScanForOwner } from "./scan.service.js";
 import { revalidateScanRoot, resolveSafeChild, FsSafetyError } from "../lib/fsSafety.js";
 import { extractImports, isSupportedExtractionLanguage } from "../lib/importExtraction.js";
-import { buildInventoryIndex, resolveImport } from "../lib/importResolution.js";
+import {
+  buildInventoryIndex,
+  packageEntryPoints,
+  resolveImport,
+  type ScanInventoryIndex,
+} from "../lib/importResolution.js";
+import {
+  CONFIG_LIMITS,
+  buildResolutionConfig,
+  configFilesIn,
+  unloadedConfigTargets,
+  type ConfigDiagnostic,
+  type ResolutionConfig,
+} from "../lib/resolutionConfig.js";
 import { env } from "../config/env.js";
 import { AppError } from "../utils/AppError.js";
 
@@ -72,6 +85,7 @@ export async function runAnalysisForOwner(ownerId: string, scanId: string): Prom
   }
 
   const inventory = buildInventoryIndex(scan.items);
+  const { config: resolutionConfig, readDiagnostics } = await loadResolutionConfig(canonicalPath, scan.items);
   const relationships: RelationshipInput[] = [];
   let totalFilesAnalyzed = 0;
   let totalFilesSkipped = 0;
@@ -131,7 +145,7 @@ export async function runAnalysisForOwner(ownerId: string, scanId: string): Prom
         continue;
       }
 
-      const resolved = resolveImport(item.relativePath, site.rawImport, inventory);
+      const resolved = resolveImport(item.relativePath, site.rawImport, inventory, resolutionConfig);
       relationships.push({
         importerRelativePath: item.relativePath,
         rawImport: site.rawImport,
@@ -175,7 +189,79 @@ export async function runAnalysisForOwner(ownerId: string, scanId: string): Prom
       byStatus,
     },
     relationships,
+    resolutionConfig: summarizeResolutionConfig(resolutionConfig, readDiagnostics, inventory),
   });
+}
+
+// Task 1 (ADR-028): config files are read through the SAME safe-path
+// boundary as source files, only if the scan observed them, and bounded
+// in count and size. Nothing is evaluated; package-based and out-of-root
+// `extends` are recorded as unsupported by the pure builder.
+const MAX_CONFIG_BYTES = 512_000;
+
+async function loadResolutionConfig(
+  canonicalPath: string,
+  items: readonly { relativePath: string; type: string; status: string }[],
+): Promise<{ config: ResolutionConfig; readDiagnostics: ConfigDiagnostic[] }> {
+  const observed = new Set(
+    items.filter((i) => i.type === "file" && i.status === "scanned").map((i) => i.relativePath),
+  );
+  const loaded = new Map<string, string>();
+  const readDiagnostics: ConfigDiagnostic[] = [];
+
+  const tryLoad = async (file: string) => {
+    if (loaded.size >= CONFIG_LIMITS.maxConfigFiles) return;
+    try {
+      const abs = resolveSafeChild(canonicalPath, file);
+      const stat = await fs.stat(abs);
+      if (stat.size > MAX_CONFIG_BYTES) {
+        readDiagnostics.push({ file, message: "Config file exceeds the size limit; ignored" });
+        return;
+      }
+      loaded.set(file, await fs.readFile(abs, "utf-8"));
+    } catch {
+      readDiagnostics.push({ file, message: "Config file could not be read; ignored" });
+    }
+  };
+
+  for (const file of configFilesIn(observed)) await tryLoad(file);
+  // Relative extends/references may name files outside the default pattern.
+  for (let round = 0; round < CONFIG_LIMITS.maxExtendsDepth; round += 1) {
+    const more = unloadedConfigTargets(loaded, observed);
+    if (more.length === 0) break;
+    for (const file of more) await tryLoad(file);
+  }
+  return { config: buildResolutionConfig(loaded), readDiagnostics };
+}
+
+const SUMMARY_LIMIT = 100;
+
+function summarizeResolutionConfig(
+  config: ResolutionConfig,
+  readDiagnostics: ConfigDiagnostic[],
+  inventory: ScanInventoryIndex,
+) {
+  return {
+    aliasScopes: [...config.aliasScopes.entries()]
+      .sort(([a], [b]) => a.localeCompare(b))
+      .slice(0, SUMMARY_LIMIT)
+      .map(([dir, s]) => ({
+        dir,
+        configFile: s.configFile,
+        baseUrl: s.baseUrl ?? null,
+        patterns: s.paths.map((p) => p.pattern),
+        ambiguous: s.ambiguous ?? null,
+      })),
+    packages: config.packages.slice(0, SUMMARY_LIMIT).map((p) => ({
+      file: p.file,
+      name: p.name ?? null,
+      hasExports: p.exports !== undefined,
+      hasImports: p.imports !== undefined,
+      // Task 2 (ADR-029): declared entry points that exist in this scan.
+      entryPoints: packageEntryPoints(p, inventory).slice(0, SUMMARY_LIMIT),
+    })),
+    diagnostics: [...readDiagnostics, ...config.diagnostics].slice(0, SUMMARY_LIMIT),
+  };
 }
 
 export async function getLatestAnalysisForOwner(

@@ -10,6 +10,18 @@ export type AffectedFileEvidence = "in_scan" | "not_in_scan" | "unverified";
 export type ImpactRelation =
   "target" | "dependency" | "direct_dependent" | "transitive_dependent" | "dependency_and_dependent";
 
+/** Task 3: a statement from the AI's own text, checked by the server against the scan. */
+export type ClaimKind = "imports" | "imported_by" | "mentions";
+export type ClaimStatus = "supported" | "not_found" | "in_scan" | "not_in_scan" | "unverifiable";
+export interface ClaimCheck {
+  kind: ClaimKind;
+  target: string;
+  /** Set when the text itself names the other file ("a.ts imports b.ts"). */
+  subject?: string;
+  status: ClaimStatus;
+  note?: string;
+}
+
 /** The AI's stated intent for a file — a claim, not evidence. */
 export type AffectedFileChange = "modify" | "create" | "test" | "reference";
 
@@ -27,6 +39,10 @@ export interface AffectedFile {
   impactRelation?: ImpactRelation;
   /** Server-set: why a grounded plan still could not verify this path. */
   evidenceNote?: string;
+  /** Server-set (Task 3): tempId of an earlier task this one depends on that creates this path. */
+  plannedBy?: string;
+  /** Server-set (Task 3): statements in `reason` checked against the scan. */
+  claimChecks?: ClaimCheck[];
 }
 
 /** The exact scan + analysis a plan was grounded in (Batch C5). */
@@ -50,6 +66,13 @@ export interface PlanSourceContext {
   };
   // Stage 5 / Stage 4 — absent on older plans.
   coverage?: { stoppedEarly: string[]; unreadDirectories: number; ignoredDirectories: number };
+  // Task 3 — the import-resolution configuration behind the evidence; absent on older plans.
+  resolution?: {
+    aliasConfigs: string[];
+    localPackages: number;
+    diagnosticsTotal: number;
+    diagnostics: { file: string; message: string }[];
+  };
   impact?: {
     file: string;
     inGraph: boolean;
@@ -58,6 +81,10 @@ export interface PlanSourceContext {
     directDependencies: number;
     directDependents: number;
     transitiveDependentsShown: number;
+    // Task 2 — exact totals; absent on older plans.
+    dependentsAtAnyDepth?: number;
+    typeOnlyDependents?: number;
+    entryPointsAffected?: number;
     truncated: boolean;
   } | null;
   counts: {
@@ -84,6 +111,8 @@ export interface SuggestedTask {
   rationale?: string;
   testingApproach?: string;
   affectedFiles?: AffectedFile[];
+  /** Server-set (Task 3): paths/relationships named in the task's own text, checked. */
+  mentionedPaths?: ClaimCheck[];
 }
 
 export interface Plan {

@@ -19,12 +19,31 @@ import { EmptyState } from "../../components/ui/EmptyState";
 import { SelectField } from "../../components/forms/SelectField";
 import { PLAN_STATUS_META, PRIORITY_META } from "../../lib/statusMeta";
 import { AffectedFileList } from "../../components/plans/AffectedFileList";
+import { ClaimCheckList } from "../../components/plans/ClaimCheckList";
 import { errorMessage } from "../../lib/errorMessage";
 import { useLatestScan } from "../../queries/scanQueries";
 import { useDependencyGraph } from "../../queries/graphQueries";
 import type { Plan } from "../../types/plan";
 
-function PlanEvidenceSummary({ plan, latestScanId }: { plan: Plan; latestScanId: string | undefined }) {
+/** "3 days ago" — coarse on purpose; the exact time is shown next to it. */
+function age(iso: string, now = Date.now()): string {
+  const minutes = Math.max(0, Math.round((now - new Date(iso).getTime()) / 60_000));
+  if (minutes < 60) return minutes <= 1 ? "just now" : `${minutes} minutes ago`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 48) return `${hours} hour${hours === 1 ? "" : "s"} ago`;
+  return `${Math.round(hours / 24)} days ago`;
+}
+
+function PlanEvidenceSummary({
+  plan,
+  latestScanId,
+  latestAnalysis,
+}: {
+  plan: Plan;
+  latestScanId: string | undefined;
+  /** The latest analysis of the latest scan, when known. */
+  latestAnalysis: { scanId: string; analysisId: string } | undefined;
+}) {
   const ctx = plan.sourceContext;
   if (!ctx) {
     return (
@@ -37,6 +56,9 @@ function PlanEvidenceSummary({ plan, latestScanId }: { plan: Plan; latestScanId:
   const cov = ctx.coverage;
   const coverageGaps = cov ? cov.unreadDirectories - cov.ignoredDirectories : 0;
   const stale = latestScanId !== undefined && latestScanId !== ctx.scan;
+  const reanalysed =
+    !stale && latestAnalysis?.scanId === ctx.scan && latestAnalysis.analysisId !== ctx.analysis;
+  const resolution = ctx.resolution;
   const impact = ctx.impact;
   const targetReferenced =
     impact && plan.suggestedTasks.some((t) => (t.affectedFiles ?? []).some((f) => f.path === impact.file));
@@ -51,9 +73,24 @@ function PlanEvidenceSummary({ plan, latestScanId }: { plan: Plan; latestScanId:
           </span>
         </p>
       )}
+      {reanalysed && (
+        <p role="note" className="mb-2 flex items-start gap-1 text-warning-800">
+          <AlertTriangle className="mt-0.5 h-3 w-3 shrink-0" aria-hidden="true" />
+          <span>
+            This scan was analysed again after the plan was generated. The plan&apos;s file labels use the
+            earlier analysis.
+          </span>
+        </p>
+      )}
       <p className="font-semibold text-slate-700">
         Grounded in scan
-        {ctx.scanCreatedAt ? ` from ${new Date(ctx.scanCreatedAt).toLocaleString()}` : ""}
+        {ctx.scanCreatedAt
+          ? ` from ${new Date(ctx.scanCreatedAt).toLocaleString()} (${age(ctx.scanCreatedAt)})`
+          : ""}
+      </p>
+      <p className="mt-1">
+        DevFlow does not watch the source folder: files changed after this scan are not reflected. Run a new
+        scan to refresh the evidence.
       </p>
       <p className="mt-1">
         {c.files} files · {c.confirmedEdges} confirmed dependencies · {c.unresolved} unresolved ·{" "}
@@ -77,11 +114,44 @@ function PlanEvidenceSummary({ plan, latestScanId }: { plan: Plan; latestScanId:
           {cov.unreadDirectories} directories were not read. Files there are labelled unverified, not absent.
         </p>
       )}
+      {resolution && (
+        <p className="mt-1">
+          Import resolution:{" "}
+          {resolution.aliasConfigs.length > 0
+            ? `path aliases from ${resolution.aliasConfigs.join(", ")}`
+            : "no path aliases configured"}
+          {resolution.localPackages > 0 ? `; ${resolution.localPackages} local package.json file(s)` : ""}.
+        </p>
+      )}
+      {resolution && resolution.diagnosticsTotal > 0 && (
+        <div className="mt-1 text-warning-800">
+          <p>
+            {resolution.diagnosticsTotal} configuration problem(s) — imports that depend on them are left
+            unresolved or unsupported, so some dependencies may be missing:
+          </p>
+          <ul className="list-inside list-disc" aria-label="Import configuration problems">
+            {resolution.diagnostics.map((d) => (
+              <li key={`${d.file}:${d.message}`}>
+                <code>{d.file}</code>: {d.message}
+              </li>
+            ))}
+            {resolution.diagnosticsTotal > resolution.diagnostics.length && (
+              <li>…and {resolution.diagnosticsTotal - resolution.diagnostics.length} more</li>
+            )}
+          </ul>
+        </div>
+      )}
       {impact && (
         <p className="mt-1">
           Planned change target: <code>{impact.file}</code> — {impact.directDependents} direct dependents,{" "}
           {impact.transitiveDependentsShown} indirect dependents shown to the AI (within {impact.maxDepth}{" "}
           import hops){impact.truncated ? "; the impact was cut off, so more files may be affected" : ""}.
+          {impact.dependentsAtAnyDepth !== undefined &&
+            ` In total ${impact.dependentsAtAnyDepth} file(s) depend on it at any depth${
+              impact.typeOnlyDependents
+                ? ` (${impact.typeOnlyDependents} only through type-only imports)`
+                : ""
+            }${impact.entryPointsAffected ? `; ${impact.entryPointsAffected} entry point(s) reach it` : ""}.`}{" "}
           Dependents may be affected; they do not all need to change.
           {!targetReferenced && " No task in this plan references the target file."}
         </p>
@@ -283,7 +353,11 @@ export default function ProjectPlansTab() {
               </span>
             </div>
 
-            <PlanEvidenceSummary plan={reviewingPlan} latestScanId={latestScan?._id} />
+            <PlanEvidenceSummary
+              plan={reviewingPlan}
+              latestScanId={latestScan?._id}
+              latestAnalysis={graph ? { scanId: graph.scanId, analysisId: graph.analysisId } : undefined}
+            />
 
             {reviewingPlan.assumptions.length > 0 && (
               <div>
@@ -337,7 +411,14 @@ export default function ProjectPlansTab() {
                       <AffectedFileList
                         files={task.affectedFiles ?? []}
                         label={`Affected files for ${task.title}`}
+                        taskTitle={(id) => reviewingPlan.suggestedTasks.find((t) => t.tempId === id)?.title}
                       />
+                      <div className="text-xs">
+                        <ClaimCheckList
+                          checks={task.mentionedPaths}
+                          label={`Checked statements in the text of ${task.title}`}
+                        />
+                      </div>
                       {task.dependsOn.length > 0 && (
                         <p className="mt-1 text-xs text-slate-400">
                           Depends on:{" "}

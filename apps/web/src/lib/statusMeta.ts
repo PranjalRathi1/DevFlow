@@ -2,7 +2,13 @@ import type { BadgeTone } from "../components/ui/Badge";
 import type { ProjectStatus } from "../types/project";
 import type { RequirementStatus, Priority } from "../types/requirement";
 import type { TaskStatus } from "../types/task";
-import type { AffectedFileChange, AffectedFileEvidence, ImpactRelation, PlanStatus } from "../types/plan";
+import type {
+  AffectedFileChange,
+  AffectedFileEvidence,
+  ImpactRelation,
+  PlanStatus,
+  ClaimStatus,
+} from "../types/plan";
 import type { ScanOutcome } from "../types/scan";
 import type { NonConfirmedStatus } from "../types/graph";
 
@@ -49,6 +55,16 @@ export const AFFECTED_FILE_CHANGE_LABELS: Record<AffectedFileChange, string> = {
 
 // Worded as possibilities, never obligations: an import edge does not
 // prove runtime use, and "may be affected" does not mean "must change".
+// Task 3: DevFlow's finding for a statement in the AI's text. Wording
+// never says "true"/"false": "not shown by scan" is not "wrong".
+export const CLAIM_STATUS_META: Record<ClaimStatus, { label: string; tone: BadgeTone }> = {
+  supported: { label: "Supported by scan", tone: "success" },
+  not_found: { label: "Not shown by scan", tone: "warning" },
+  in_scan: { label: "In scan", tone: "success" },
+  not_in_scan: { label: "Not in scan", tone: "warning" },
+  unverifiable: { label: "Could not check", tone: "neutral" },
+};
+
 export const IMPACT_RELATION_LABELS: Record<ImpactRelation, string> = {
   target: "the planned change target",
   dependency: "imported by the target (changing the target does not affect it)",

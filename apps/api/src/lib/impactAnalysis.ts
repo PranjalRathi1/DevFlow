@@ -1,5 +1,6 @@
 import {
   getTransitiveDependents,
+  type GraphEdge,
   type DependencyGraphResult,
   type GraphEdgeEvidence,
   type NonConfirmedRelationship,
@@ -44,7 +45,33 @@ export const IMPACT_LIMITATIONS = [
   "Based on static import statements only: an edge shows that one file imports another, not that an imported symbol is used or when it runs.",
   "Runtime wiring (route registration, middleware order, dependency injection, dynamic or configuration-driven loading) is not analysed.",
   "Imports that could not be resolved, are unsupported, or sit in files that failed to parse cannot be traced, so real dependents may be missing — see `untraceable`.",
+  '"type_only" reach is proven by syntax (import type / export type / import("…") types). "runtime" means NOT proven type-only: TypeScript may still erase an import whose names are only used as types.',
+  "Re-exports (barrels) are followed as real dependencies; a dependent reached only through re-exports may not use anything from this file (symbols are not analysed).",
+  "Entry points are those declared in package.json (exports/main/module/types/bin) or files no analysed file imports; framework conventions (file-system routing, config-loaded modules) are not detected.",
 ];
+
+/**
+ * Task 2 (ADR-029). "runtime": reaches the file through at least one path
+ * of edges not proven type-only. "type_only": every path contains a
+ * type-only edge — a compile-time dependency only.
+ */
+export type ImpactReach = "runtime" | "type_only";
+
+export interface ImpactReachLabels {
+  reach: ImpactReach;
+  /** Every path to the selected file passes through a re-export (`export … from`) edge. */
+  onlyThroughReExports?: true;
+}
+
+export interface AffectedEntryPoint extends ImpactReachLabels {
+  file: string;
+  /** Import hops to the selected file (0 = the selected file itself). */
+  depth: number;
+  /** package.json fields declaring it, e.g. 'packages/ui/package.json exports["."] [import]'. */
+  declaredBy: string[];
+  /** No analysed file imports it (an app entry, a test, a script — or unused code). */
+  noImporters: boolean;
+}
 
 export interface ImpactEdgeEvidence {
   rawImport: string;
@@ -58,11 +85,14 @@ export interface ImpactEdgeEvidence {
 
 export interface ImpactNeighbor {
   file: string;
+  /** Dependents only (Task 2): how this file reaches the selected one. */
+  reach?: ImpactReach;
+  onlyThroughReExports?: true;
   /** Evidence of the confirmed edge between this file and the selected one, in source order. */
   evidence: ImpactEdgeEvidence[];
 }
 
-export interface TransitiveImpact {
+export interface TransitiveImpact extends ImpactReachLabels {
   file: string;
   /** Import hops to the selected file (always >= 2 here; depth 1 is `directDependents`). */
   depth: number;
@@ -81,6 +111,14 @@ export interface ImpactResult {
   transitiveDependents: TransitiveImpact[];
   /** Exact counts before any cap — compare with the list lengths. */
   totals: { directDependencies: number; directDependents: number };
+  /**
+   * Task 2: EXACT counts over every dependent at any depth (computed over
+   * the whole graph, not the bounded lists). `runtime + typeOnly = all`.
+   */
+  dependentTotals: { all: number; runtime: number; typeOnly: number; onlyThroughReExports: number };
+  /** Entry points among the selected file and ALL its dependents, sorted by (depth, file), capped at `bounds.maxNodes`. */
+  affectedEntryPoints: AffectedEntryPoint[];
+  affectedEntryPointsTotal: number;
   /** True when `maxNodes` capped a direct list, or `maxDepth`/`maxNodes` cut the dependent traversal short. */
   truncated: boolean;
   bounds: { maxDepth: number; maxNodes: number };
@@ -123,14 +161,69 @@ function toEvidence(ev: readonly GraphEdgeEvidence[]): ImpactEdgeEvidence[] {
 }
 
 const byFile = (a: { file: string }, b: { file: string }) => a.file.localeCompare(b.file);
+
+const isTypeOnlyEdge = (e: GraphEdge) => e.evidence.length > 0 && e.evidence.every((v) => v.typeOnly);
+const isReExportOnlyEdge = (e: GraphEdge) =>
+  e.evidence.length > 0 && e.evidence.every((v) => v.importType === "export_from");
+
+/**
+ * Unbounded reverse BFS (importer <- imported) over the edges `keep`
+ * accepts: every file that reaches `target`, with its shortest hop count.
+ * O(V + E); cycle-safe (each file visited once); the target is excluded.
+ */
+function reachingFiles(
+  edges: readonly GraphEdge[],
+  target: string,
+  keep: (e: GraphEdge) => boolean,
+): Map<string, number> {
+  const importersOf = new Map<string, string[]>();
+  for (const e of edges) {
+    if (e.from === e.to || !keep(e)) continue;
+    const list = importersOf.get(e.to) ?? [];
+    list.push(e.from);
+    importersOf.set(e.to, list);
+  }
+  const depth = new Map<string, number>([[target, 0]]);
+  let frontier = [target];
+  for (let d = 1; frontier.length > 0; d += 1) {
+    const next: string[] = [];
+    for (const f of frontier) {
+      for (const importer of importersOf.get(f) ?? []) {
+        if (!depth.has(importer)) {
+          depth.set(importer, d);
+          next.push(importer);
+        }
+      }
+    }
+    frontier = next;
+  }
+  depth.delete(target);
+  return depth;
+}
+
+export interface ComputeImpactOptions {
+  /** file -> declaring package.json fields (from the analysis' resolution config). */
+  entryPoints?: ReadonlyMap<string, readonly string[]>;
+}
 const ofFile = (file: string) => (r: NonConfirmedRelationship) => r.importerRelativePath === file;
 
 export function computeImpact(
   graph: DependencyGraphResult,
   file: string,
   bounds: { maxDepth: number; maxNodes: number },
+  options: ComputeImpactOptions = {},
 ): ImpactResult {
   const edgeEvidence = new Map(graph.edges.map((e) => [`${e.from}::${e.to}`, e.evidence]));
+  // Task 2: exact reach sets. A file absent from `runtimeReach` reaches the
+  // target only through type-only edges; absent from `nonReExportReach`,
+  // only through re-exports.
+  const allReach = reachingFiles(graph.edges, file, () => true);
+  const runtimeReach = reachingFiles(graph.edges, file, (e) => !isTypeOnlyEdge(e));
+  const nonReExportReach = reachingFiles(graph.edges, file, (e) => !isReExportOnlyEdge(e));
+  const labels = (f: string): ImpactReachLabels => ({
+    reach: runtimeReach.has(f) ? "runtime" : "type_only",
+    ...(nonReExportReach.has(f) ? {} : { onlyThroughReExports: true as const }),
+  });
   const inGraph = graph.nodes.some((n) => n.id === file);
   const selfEvidence = edgeEvidence.get(`${file}::${file}`);
 
@@ -140,7 +233,7 @@ export function computeImpact(
     .sort(byFile);
   const allDirectDependents = graph.edges
     .filter((e) => e.to === file && e.from !== file)
-    .map((e) => ({ file: e.from, evidence: toEvidence(e.evidence) }))
+    .map((e) => ({ file: e.from, ...labels(e.from), evidence: toEvidence(e.evidence) }))
     .sort(byFile);
 
   // A hub file can have thousands of direct importers; the response stays bounded.
@@ -153,10 +246,29 @@ export function computeImpact(
     .filter((d) => d.depth >= 2)
     .map((d) => ({
       file: d.id,
+      ...labels(d.id),
       depth: d.depth,
       via: d.via,
       evidence: toEvidence(edgeEvidence.get(`${d.id}::${d.via}`) ?? []),
     }));
+
+  const hasImporters = new Set(graph.edges.filter((e) => e.from !== e.to).map((e) => e.to));
+  const allEntryPoints: AffectedEntryPoint[] = [[file, 0] as const, ...allReach.entries()]
+    .map(([f, depth]) => ({
+      file: f,
+      depth,
+      ...(f === file ? { reach: "runtime" as const } : labels(f)),
+      declaredBy: [...(options.entryPoints?.get(f) ?? [])],
+      noImporters: !hasImporters.has(f),
+    }))
+    .filter((p) => p.declaredBy.length > 0 || p.noImporters)
+    .sort((a, b) => a.depth - b.depth || a.file.localeCompare(b.file));
+  let runtimeCount = 0;
+  let reExportOnlyCount = 0;
+  for (const f of allReach.keys()) {
+    if (runtimeReach.has(f)) runtimeCount += 1;
+    if (!nonReExportReach.has(f)) reExportOnlyCount += 1;
+  }
 
   const allCycles = graph.cycles.filter((c) => c.includes(file));
   const ownUnresolved = graph.unresolved.filter(ofFile(file));
@@ -178,6 +290,14 @@ export function computeImpact(
       directDependencies: allDirectDependencies.length,
       directDependents: allDirectDependents.length,
     },
+    dependentTotals: {
+      all: allReach.size,
+      runtime: runtimeCount,
+      typeOnly: allReach.size - runtimeCount,
+      onlyThroughReExports: reExportOnlyCount,
+    },
+    affectedEntryPoints: allEntryPoints.slice(0, bounds.maxNodes),
+    affectedEntryPointsTotal: allEntryPoints.length,
     truncated:
       reach.truncated ||
       allCycles.length > cycles.length ||
@@ -249,8 +369,16 @@ const cite = (n: ImpactNeighbor) => {
   const lines = n.evidence.flatMap((e) => (e.line !== undefined ? [e.line] : []));
   // Every statement type-only => no runtime import between the two files.
   const typeOnly = n.evidence.length > 0 && n.evidence.every((e) => e.typeOnly) ? " (type-only)" : "";
-  return `${lines.length ? `${n.file}:${lines.join(",")}` : n.file}${typeOnly}`;
+  // Task 2: a dependent whose ONLY paths are type-only / re-exports.
+  const reach = n.reach === "type_only" && !typeOnly ? " (type-only reach)" : "";
+  const barrel = n.onlyThroughReExports ? " (re-exports only)" : "";
+  return `${lines.length ? `${n.file}:${lines.join(",")}` : n.file}${typeOnly}${reach}${barrel}`;
 };
+
+const reachNote = (t: ImpactReachLabels) =>
+  `${t.reach === "type_only" ? ", type-only reach" : ""}${t.onlyThroughReExports ? ", re-exports only" : ""}`;
+
+const PROMPT_ENTRY_POINTS = 10;
 
 /**
  * Deterministic prompt section. Wording is deliberate: dependents are
@@ -273,9 +401,31 @@ export function renderImpactForPrompt(
     `- It imports (dependencies; changing it does NOT imply these are affected) (${shown(impact.directDependencies.length, impact.totals.directDependencies)}): ${impact.directDependencies.map(cite).join(", ") || "none"}`,
     `- Imported directly by (MAY be affected) (${shown(impact.directDependents.length, impact.totals.directDependents)}): ${impact.directDependents.map(cite).join(", ") || "none"}`,
     `- Reaches it through 2-${impact.bounds.maxDepth} import hops (MAY be affected): ${
-      impact.transitiveDependents.map((t) => `${t.file} (${t.depth} hops, via ${t.via})`).join(", ") || "none"
+      impact.transitiveDependents
+        .map((t) => `${t.file} (${t.depth} hops, via ${t.via}${reachNote(t)})`)
+        .join(", ") || "none"
     }`,
   );
+  const totals = impact.dependentTotals;
+  if (totals.all > 0) {
+    lines.push(
+      `- Exactly ${totals.all} file(s) depend on it at any depth: ${totals.runtime} possibly at runtime, ${totals.typeOnly} only through type-only imports (compile-time)${totals.onlyThroughReExports ? `; ${totals.onlyThroughReExports} only through re-exports` : ""}.`,
+    );
+  }
+  const entries = impact.affectedEntryPoints.filter((p) => p.file !== impact.file);
+  if (entries.length > 0) {
+    const shownEntries = entries.slice(0, PROMPT_ENTRY_POINTS);
+    const selfListed = impact.affectedEntryPoints.some((p) => p.file === impact.file) ? 1 : 0;
+    const describe = (p: AffectedEntryPoint) =>
+      [p.declaredBy.length ? "package entry" : "", p.noImporters ? "no importers" : ""]
+        .filter(Boolean)
+        .join(", ");
+    lines.push(
+      `- Entry points that reach it (${shown(shownEntries.length, impact.affectedEntryPointsTotal - selfListed)}; declared in package.json, or imported by no analysed file): ${shownEntries
+        .map((p) => `${p.file} (${describe(p)}${reachNote(p)})`)
+        .join(", ")}`,
+    );
+  }
   const tests = [...impact.directDependents, ...impact.transitiveDependents]
     .map((d) => d.file)
     .filter((f) => categoryOf(f) === "test");

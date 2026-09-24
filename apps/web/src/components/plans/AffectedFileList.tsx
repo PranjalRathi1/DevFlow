@@ -6,11 +6,14 @@ import {
   IMPACT_RELATION_LABELS,
 } from "../../lib/statusMeta";
 import type { AffectedFile } from "../../types/plan";
+import { ClaimCheckList } from "./ClaimCheckList";
 
 interface AffectedFileListProps {
   files: AffectedFile[];
   /** Accessible name for the list, e.g. "Affected files for Add limiter". */
   label: string;
+  /** Resolves a plan task id to its title, where the plan is at hand. */
+  taskTitle?: (tempId: string) => string | undefined;
 }
 
 /**
@@ -19,7 +22,7 @@ interface AffectedFileListProps {
  * plain text; the server's findings (evidence badge, import counts,
  * conflict) are visually distinct.
  */
-export function AffectedFileList({ files, label }: AffectedFileListProps) {
+export function AffectedFileList({ files, label, taskTitle }: AffectedFileListProps) {
   if (files.length === 0) return null;
   return (
     <ul className="mt-2 flex flex-col gap-1.5" aria-label={label}>
@@ -44,10 +47,21 @@ export function AffectedFileList({ files, label }: AffectedFileListProps) {
                 Verified relation: {IMPACT_RELATION_LABELS[file.impactRelation]}
               </p>
             )}
+            {file.plannedBy && (
+              <p className="mt-0.5 text-slate-600">
+                Not in the scan yet: created earlier in this plan by &ldquo;
+                {taskTitle?.(file.plannedBy) ?? file.plannedBy}&rdquo;, which this task depends on.
+              </p>
+            )}
             {file.evidenceNote && (
               <p className="mt-0.5 text-slate-500">Why unverified: {file.evidenceNote}</p>
             )}
             {file.reason && <p className="mt-0.5 text-slate-500">AI&apos;s reason: {file.reason}</p>}
+            <ClaimCheckList
+              checks={file.claimChecks}
+              about={file.path}
+              label={`Checked statements about ${file.path}`}
+            />
             {file.conflict && (
               <p className="mt-0.5 flex items-start gap-1 text-warning-800">
                 <AlertTriangle className="mt-0.5 h-3 w-3 shrink-0" aria-hidden="true" />

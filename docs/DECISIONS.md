@@ -1407,3 +1407,228 @@ _Alternatives rejected_: raising `OLLAMA_NUM_CTX` automatically (a
 resource cost that must be chosen explicitly); dropping whole sections,
 which would lose the category distinctions and totals; and
 relevance-by-embedding, which adds a dependency and isn't deterministic.
+
+## ADR-028: tsconfig/jsconfig aliases, package imports/exports, workspaces (Task 1)
+
+**Problem**: every `@/…` or `paths` import was `unsupported`, and every
+workspace package import was `external`. On alias-heavy projects most
+local edges were missing from the graph. A real Next.js project
+(`portfolio_new`) had 69 unsupported imports and 0 confirmed edges.
+
+**Decision**: `lib/resolutionConfig.ts` is pure: it takes config text in
+and gives a resolution config out, with no fs access.
+`analysis.service` reads config files only if the scan observed them,
+through `resolveSafeChild`, at most 200 files of at most 512 KB each.
+Nothing is executed or evaluated.
+
+- **Discovery**: `tsconfig*.json`, `jsconfig*.json` and `package.json`,
+  plus any file named by a relative `extends`/`references`, so
+  `configs/base.json` works too. Parsing uses TypeScript's own JSONC
+  parser, so comments and trailing commas are accepted.
+- **extends**: only relative chains inside the scan root are followed,
+  capped at depth 10. In an `extends` array, later entries win, and the
+  child overrides its parents. A package-based `extends`, an out-of-root
+  target, a missing target, a cycle or excess depth each produce a
+  diagnostic, never a guess; the config's own settings still apply.
+- **Scope**: an importer uses its nearest ancestor directory's
+  `tsconfig.json`, else that directory's `jsconfig.json`. A solution
+  config that has only `references` takes its referenced projects'
+  aliases only if every defining reference agrees. Otherwise the scope is
+  _ambiguous_ and matching imports are `unresolved`, because choosing
+  would mean evaluating `include` globs.
+- **paths** (TypeScript's rules): an exact key wins, else the wildcard
+  with the longest prefix. Substitutions are tried in config order and
+  the first that resolves wins. They are relative to `baseUrl`, else to
+  the config that _defined_ `paths`. A catch-all `"*"` falls through to
+  package lookup. Each candidate goes through the unchanged relative
+  rules (extension, index, NodeNext for TS importers, ambiguity and
+  case-mismatch checks). No match means `unresolved`, listing the paths
+  tried. Targets outside the root are `unsupported`.
+- **baseUrl**: only a hit counts; a miss falls through, exactly as in
+  TypeScript, so `react` stays external.
+- **package `#imports`** (nearest package.json) and **workspace
+  packages** (a `name` found in the scan): the `exports`/`imports`
+  value is flattened over conditions, and the result is confirmed only if
+  every in-scan leaf resolves to the _same_ file. Differing conditions
+  mean `unresolved` ("not picked"); only-missing leaves mean
+  `unresolved` ("may point to build output"). Fallback arrays, targets
+  that aren't `./`-relative, and targets escaping the package directory
+  are `unsupported`. `null` means excluded. Duplicate package names are
+  `unresolved`. A package without `exports` uses `types`/`module`/
+  `main`, else index, and subpaths join the package directory.
+- **Behaviour change**: `#x` was previously `external`. It is a
+  package-internal specifier, so it is now `unresolved` unless an
+  `imports` entry resolves it.
+- **Evidence**: the raw import is unchanged; `resolutionMethod` records
+  pattern, config, and inner rule; `Analysis.resolutionConfig` stores
+  scopes, packages, and diagnostics.
+
+**Verified**:
+
+- 38 unit tests plus an API fixture, a monorepo with 13 import kinds
+  covering relationships, config summary, graph edges, and byte and mtime
+  identity.
+- 8 mutations are all caught: ambiguous scope ignored, differing
+  conditions picked, root escape, shortest prefix, baseUrl miss not
+  falling through, extends precedence, package escape, last substitution
+  wins.
+- Before/after on real repositories:
+  - DevFlow: 637 confirmed, identical.
+  - `node_modules/mongodb`: 1,848 confirmed, identical.
+  - `portfolio_new`: 0 → 68 confirmed and 69 → 1 unsupported (the
+    remaining one is CSS). All 68 match `ts.resolveModuleName` exactly,
+    and the tree was byte- and mtime-identical afterwards.
+
+**Not supported (recorded, never guessed)**: package-based `extends`
+(needs `node_modules`), `include`/`exclude`/`files` evaluation,
+`rootDirs`, `moduleSuffixes`, `customConditions`, exports fallback
+arrays, multi-`*` patterns, `.d.ts` targets, Yarn PnP, and bundler-only
+aliases (vite/webpack `resolve.alias`), which are code, not data.
+
+## ADR-029: Impact accuracy — runtime vs type-only reach, barrels, entry points (Task 2)
+
+**Problem**: impact treated every edge alike. A file that only reaches the
+target through `import type` was listed as "may be affected" exactly like a
+runtime importer. Barrel re-exports were not marked, and there was no
+notion of entry points. Totals covered only the bounded lists.
+
+**Decision** (`lib/impactAnalysis.ts`, pure):
+
+- **Reach**: three unbounded reverse BFS passes, each O(V+E),
+  deterministic and cycle-safe:
+  - over all edges
+  - over edges not proven type-only (an edge is type-only only if _every_
+    statement on it is)
+  - over edges that aren't re-export-only (`export … from`)
+
+  A dependent missing from the second set has `reach: "type_only"`; one
+  missing from the third has `onlyThroughReExports`. The existing BFS,
+  depths, `via`, bounds and `truncated` are unchanged.
+
+- **Exact totals**: `dependentTotals` (all / runtime / typeOnly /
+  onlyThroughReExports) cover every dependent at any depth, so a truncated
+  list is still quantified.
+- **Entry points**: at analysis time, `packageEntryPoints` resolves
+  non-wildcard `exports` leaves, `main`/`module`/`types` and `bin` with
+  the import file rules. It does not map build output onto sources (a
+  declared `dist/x.js` or `./src/x.js` is not `src/x.ts`). The results
+  are stored in `Analysis.resolutionConfig.packages[].entryPoints`. Impact
+  lists the affected ones plus files no analysed file imports, marking the
+  second kind `noImporters` rather than calling them entry points outright.
+- **Prompt**: the planning impact section now shows type-only and
+  re-export labels, the exact totals, and up to 10 entry points with
+  "shown of total". The plan's `sourceContext.impact` records the totals.
+- **Wording is deliberate**: `runtime` means _not proven type-only_.
+  TypeScript can still elide an import whose names are only used as
+  types; proving that needs the type checker.
+
+**Verified**:
+
+- A hand-derived fixture: 10 dependents covering a mixed statement pair,
+  a type-only chain, a barrel, a facade that both imports and re-exports,
+  a cycle, and declared and root entry points.
+- 40 seeded random graphs, with several statements per pair, checked
+  against an independent Floyd–Warshall oracle for reach sets, depths,
+  labels, totals and entry points.
+- An API fixture (package `main` and `bin`, byte-identical afterwards).
+- 10 mutations, all caught.
+- **Real soundness check**: DevFlow's backend was emitted with `tsc` into
+  a scratch directory, and the emitted-JS graph compared with the labels
+  on 73 targets:
+  - 48 `type_only` labels, and 0 of them reach the target in the emitted
+    JS
+  - 795 `runtime` labels, and 0 contradicted by the emit
+
+### Deeper analysis: evaluated, not implemented
+
+| Analysis                                                                         | Could it be done safely here?                                                                                                                                                                                                                 | Decision                                                                                                                                                                                                                                                                                              |
+| -------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Symbol-level imports** (which names A takes from B; narrowing through barrels) | Partly: named imports and `export { x } from` are syntactic. But `export *` chains, namespace imports (`import * as`), default re-exports, and `require` destructuring need a module-graph binder, and any mistake _removes_ real dependents. | **Design only.** Proposal: record imported names per statement (a syntactic subset) and use them only to _label_ a dependent "uses none of the changed exports" when every path is fully named. Never drop it from impact. Needs the changed exports as input, which the product doesn't collect yet. |
+| **Call graph**                                                                   | No: dynamic dispatch, callbacks, and higher-order functions. A syntactic call graph is systematically incomplete; the checker gives better results but is costly and still misses dynamic calls.                                              | Not pursued. It would imply precision the product can't back.                                                                                                                                                                                                                                         |
+| **Express routes / middleware order**                                            | Only a narrow subset: literal `router.get("/x", handler)` with an imported handler. Order depends on runtime `app.use` sequencing, conditional registration, and routers mounted from variables.                                              | **Design only.** A future "route registration" relationship kind, kept separate from import edges, with `unsupported` for anything non-literal.                                                                                                                                                       |
+| **Dependency injection**                                                         | No: container-specific (tsyringe, Nest, Inversify), decorator- and metadata-driven, often configured at runtime.                                                                                                                              | Not pursued. Remains listed in impact `limitations`.                                                                                                                                                                                                                                                  |
+
+## ADR-030: AI-claim labelling, evidence freshness, and review UX (Task 3)
+
+**Problem**: the AI's prose often states facts about the code: "imported by
+src/app.ts", a file name in a rationale, or "modify" of a file an earlier
+task creates. Reviewers saw these as plain text, with no check against the
+scan. The UI also didn't show how old the evidence was, whether the scan
+had been re-analysed, which alias configuration was used (ADR-028), or the
+exact impact totals (ADR-029).
+
+**Decision**:
+
+- **`lib/claimChecks.ts` (pure, deterministic, bounded)** extracts
+  path-like tokens (extension required) and the present-tense import verb
+  in the same clause before each. It then _labels_ the statement against
+  the plan's pinned scan. Rules:
+  - "supported" needs a confirmed edge in the stated direction; a
+    transitive path is not a direct import
+  - "not_found" says the scan does not show it, never that it is false
+  - intent phrasing and bare imperatives are mentions
+  - a verb never crosses a sentence boundary
+  - "a.ts imports b.ts" names its own subject
+  - bare names are never resolved: candidates are listed, and a single
+    candidate gets only a conditional finding
+  - prose without a matching scanned file name is ignored, so
+    "Node.js" is not flagged
+- **Plan-level consistency**: "modify"/"reference" of a missing path that
+  a dependency-ancestor task creates gets `plannedBy` instead of a
+  conflict. A non-ancestor creator, or duplicate "create", is flagged.
+- **Freshness**: the review shows:
+  - the scan's age
+  - that DevFlow doesn't watch the folder, so edits after the scan are
+    not reflected
+  - the existing newer-scan warning
+  - a new warning when the plan's scan has been re-analysed since
+    generation
+- **Evidence UX**: a shared `ClaimCheckList` quotes each statement as
+  the AI's, with DevFlow's badge and note, in plan review and on approved
+  tasks. The summary shows the alias configs, local packages and config
+  problems (5 shown plus "…and N more"), and the exact impact totals
+  (dependents at any depth, type-only, entry points).
+
+**Verified**:
+
+- 14 claim unit tests with hand-derived labels.
+- The API lifecycle test, where the rationale "src/index.ts imports
+  src/util.ts" becomes a supported claim that survives approval verbatim.
+- A planned-creation test: transitive ancestor, unordered edit, and
+  duplicate create.
+- 7 web tests.
+- 21 mutations, all caught.
+
+**Real validation** (qwen2.5:7b, `OLLAMA_NUM_CTX` 16384), 4 generations
+across 2 projects: 3 on `portfolio_new` (Next.js, aliases) and 1 on
+DevFlow's backend.
+
+- Every run returned 201 in 22–29 s.
+- The scanned trees were byte- and mtime-identical afterwards.
+- Evidence was identical through approval (checked in the 2 approved runs).
+
+Findings:
+
+- **Aliases:** `portfolio_new` now has 68 confirmed edges (it had 0
+  before ADR-028). The `books.ts` impact is 23 dependents, 12 of them
+  type-only, with 12 entry points.
+- **Run 1 surfaced the false "modify of a missing file" conflict** that
+  `plannedBy` now resolves.
+- **A real discrepancy was flagged:** run 3 proposed "modify
+  `src/routes/analysis.routes.ts`" on a file that does not exist.
+- **The model mostly writes bare file names** ("scan.routes.ts imports
+  rateLimit.middleware.ts"). These stay `unverifiable`, with candidates.
+- **Relevance:** the in-scan files the AI chose were in the requirement
+  focus or the impact set in 11 of 12 cases across the 4 runs. The exception was
+  `auth.routes.ts` for "analysis endpoints".
+
+**Model limits (qwen2.5:7b), stated honestly**:
+
+- It ignores framework conventions (`talks/listing.tsx` instead of
+  Next.js `page.tsx`).
+- It sometimes confuses listing and detail paths.
+- It labels "add a link" as `reference`.
+- It rarely uses full paths in prose.
+
+DevFlow labels what it can check. It does not judge design quality or
+framework conventions.

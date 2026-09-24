@@ -1,5 +1,5 @@
 import type { Priority } from "./requirement";
-import type { AffectedFile } from "./plan";
+import type { AffectedFile, ClaimCheck } from "./plan";
 
 export { PRIORITIES } from "./requirement";
 export type { Priority };
@@ -30,6 +30,7 @@ export interface TaskPlanEvidence {
   rationale: string;
   testingApproach: string;
   affectedFiles: AffectedFile[];
+  mentionedPaths?: ClaimCheck[];
   sourceContext: {
     scan: string;
     analysis: string;

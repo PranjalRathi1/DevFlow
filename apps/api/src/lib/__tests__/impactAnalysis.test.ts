@@ -70,6 +70,7 @@ describe("computeImpact — direction and categories", () => {
     expect(r.transitiveDependents).toEqual([
       {
         file: "src/app.ts",
+        reach: "runtime",
         depth: 2,
         via: "src/routes.ts",
         evidence: [

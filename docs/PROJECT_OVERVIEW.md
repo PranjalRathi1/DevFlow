@@ -109,14 +109,15 @@ graphed source content. That is a future batch's scope; see
     workflow for exactly which steps are real versus deferred, and
     ADR-013/014/015 for the schema gaps this will require closing.
 - Import extraction only supports JavaScript, JSX, TypeScript, and TSX —
-  no Python or any other language. Resolution only supports relative
-  (`./`, `../`) imports against the scan's own inventory; bare packages
-  are always classified external (never checked against `node_modules`),
-  and aliases (`@/`, `~/`, tsconfig `paths`) are always unsupported, not
-  guessed. See `docs/DECISIONS.md` ADR-015.
+  no Python or any other language. Resolution supports relative imports,
+  tsconfig/jsconfig `paths`/`baseUrl` (with relative `extends`), package
+  `#imports`, and local workspace packages (`exports` subset), all against
+  the scan's own inventory. Other bare packages are external (never checked
+  against `node_modules`); anything ambiguous or unsupported is labelled,
+  not guessed. See `docs/DECISIONS.md` ADR-015 and ADR-028.
 - The Batch C3 dependency graph is built entirely from Batch C2's
   confirmed relationships — it inherits every one of the limitations
-  above (JS/TS/JSX/TSX only, no aliases, no `node_modules`) rather than
+  above (JS/TS/JSX/TSX only, no `node_modules`) rather than
   working around them. The graph itself is computed fresh on every
   request from the latest analysis, not persisted, so there's no
   separate "graph" data to go stale — but that also means there's no

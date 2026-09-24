@@ -561,4 +561,205 @@ describe("ProjectPlansTab", () => {
       expect(legend).toHaveTextContent(/not how code runs/);
     });
   });
+
+  describe("claims, freshness and resolution evidence (Task 3)", () => {
+    const ctx = {
+      scan: "scan-1",
+      analysis: "an-1",
+      contextVersion: 4,
+      truncated: false,
+      scanCreatedAt: new Date(Date.now() - 3 * 24 * 3600_000).toISOString(),
+      counts: {
+        files: 5,
+        graphNodes: 4,
+        confirmedEdges: 3,
+        unresolved: 0,
+        external: 0,
+        externalPackages: 0,
+        unsupported: 0,
+        parseErrors: 0,
+        cycles: 0,
+      },
+    };
+    async function openReview(plan: Plan, graph?: { scanId: string; analysisId: string }) {
+      vi.mocked(planService.aiStatus).mockResolvedValue({ available: true, provider: "ollama", model: "m" });
+      vi.mocked(planService.list).mockResolvedValue({ plans: [plan] });
+      vi.mocked(scanService.getLatestScan).mockResolvedValue({ scan: latestScan });
+      if (graph) {
+        vi.mocked(graphService.getGraph).mockResolvedValue({
+          graph: { ...graph, nodes: [{ id: "src/a.ts" }] },
+        } as unknown as Awaited<ReturnType<typeof graphService.getGraph>>);
+      } else {
+        vi.mocked(graphService.getGraph).mockRejectedValue(new Error("No analysis"));
+      }
+      vi.mocked(projectService.get).mockResolvedValue({ project });
+      vi.mocked(requirementService.list).mockResolvedValue({ requirements: [requirement] });
+      const user = userEvent.setup();
+      renderProjectTab(<ProjectPlansTab />, project._id);
+      await user.click(await screen.findByText("Authentication Plan"));
+      return within(await screen.findByRole("dialog"));
+    }
+
+    it("shows each checked AI statement as the AI's words next to DevFlow's finding", async () => {
+      const plan: Plan = {
+        ...samplePlan,
+        sourceContext: ctx,
+        suggestedTasks: [
+          {
+            ...samplePlan.suggestedTasks[0]!,
+            affectedFiles: [
+              {
+                path: "src/routes.ts",
+                reason: "Imported by src/app.ts and src/worker.ts",
+                evidence: "in_scan",
+                claimChecks: [
+                  {
+                    kind: "imported_by",
+                    target: "src/app.ts",
+                    status: "supported",
+                    note: "Confirmed import src/app.ts -> src/routes.ts (line 3).",
+                  },
+                  {
+                    kind: "imported_by",
+                    target: "src/worker.ts",
+                    status: "not_found",
+                    note: "No confirmed import src/worker.ts -> src/routes.ts in this scan.",
+                  },
+                ],
+              },
+            ],
+            mentionedPaths: [
+              {
+                kind: "mentions",
+                target: "src/ghost.ts",
+                status: "not_in_scan",
+                note: "The scan looked for this path and did not find it.",
+              },
+            ],
+          },
+        ],
+      };
+      const dialog = await openReview(plan);
+      const fileClaims = within(dialog.getByRole("list", { name: "Checked statements about src/routes.ts" }));
+      const items = fileClaims.getAllByRole("listitem");
+      expect(items[0]).toHaveTextContent(
+        /AI: .src\/routes\.ts is imported by src\/app\.ts.\s*Supported by scan/,
+      );
+      expect(items[1]).toHaveTextContent(
+        /src\/routes\.ts is imported by src\/worker\.ts.\s*Not shown by scan/,
+      );
+      const taskClaims = within(
+        dialog.getByRole("list", { name: "Checked statements in the text of Design schema" }),
+      );
+      expect(taskClaims.getByText("Not in scan")).toBeInTheDocument();
+      expect(taskClaims.getByText(/names src\/ghost\.ts/)).toBeInTheDocument();
+      // Never worded as a verdict on the AI.
+      expect(dialog.queryByText(/\b(false|wrong|incorrect)\b/i)).not.toBeInTheDocument();
+    });
+
+    it("explains a file created by an earlier task instead of flagging it", async () => {
+      const dialog = await openReview({
+        ...samplePlan,
+        sourceContext: ctx,
+        suggestedTasks: [
+          {
+            ...samplePlan.suggestedTasks[0]!,
+            affectedFiles: [{ path: "src/page.ts", reason: "", change: "create", evidence: "not_in_scan" }],
+          },
+          {
+            tempId: "t2",
+            title: "Fill page",
+            description: "",
+            acceptanceCriteria: [],
+            priority: "medium",
+            dependsOn: ["t1"],
+            affectedFiles: [
+              { path: "src/page.ts", reason: "", change: "modify", evidence: "not_in_scan", plannedBy: "t1" },
+            ],
+          },
+        ],
+        suggestedOrder: ["t1", "t2"],
+      });
+      const list = within(dialog.getByRole("list", { name: "Affected files for Fill page" }));
+      expect(
+        list.getByText(/created earlier in this plan by .Design schema., which this task depends on/),
+      ).toBeInTheDocument();
+      expect(list.getByText("Not in scan — proposed")).toBeInTheDocument();
+    });
+
+    it("states the evidence age and that later edits are not reflected", async () => {
+      const dialog = await openReview({ ...samplePlan, sourceContext: ctx });
+      expect(dialog.getByText(/grounded in scan from .*\(3 days ago\)/i)).toBeInTheDocument();
+      expect(dialog.getByText(/files changed after this scan are not reflected/i)).toBeInTheDocument();
+    });
+
+    it("notes when the plan's scan has been analysed again since generation", async () => {
+      const dialog = await openReview(
+        { ...samplePlan, sourceContext: ctx },
+        { scanId: "scan-1", analysisId: "an-2" },
+      );
+      expect(await dialog.findByText(/analysed again after the plan was generated/i)).toBeInTheDocument();
+    });
+
+    it("does not note re-analysis when the plan uses the latest analysis", async () => {
+      const dialog = await openReview(
+        { ...samplePlan, sourceContext: ctx },
+        { scanId: "scan-1", analysisId: "an-1" },
+      );
+      await dialog.findByText(/grounded in scan/i);
+      expect(dialog.queryByText(/analysed again/i)).not.toBeInTheDocument();
+    });
+
+    it("shows the alias configuration and its problems, bounded", async () => {
+      const dialog = await openReview({
+        ...samplePlan,
+        sourceContext: {
+          ...ctx,
+          resolution: {
+            aliasConfigs: ["apps/web/tsconfig.json"],
+            localPackages: 2,
+            diagnosticsTotal: 7,
+            diagnostics: [
+              {
+                file: "packages/ui/tsconfig.json",
+                message: 'extends "@tsconfig/strictest" refers to a package; unsupported',
+              },
+            ],
+          },
+        },
+      });
+      expect(
+        dialog.getByText(/path aliases from apps\/web\/tsconfig\.json; 2 local package\.json/),
+      ).toBeInTheDocument();
+      expect(dialog.getByText(/7 configuration problem\(s\)/)).toBeInTheDocument();
+      const problems = within(dialog.getByRole("list", { name: "Import configuration problems" }));
+      expect(problems.getByText(/refers to a package; unsupported/)).toBeInTheDocument();
+      expect(problems.getByText("…and 6 more")).toBeInTheDocument();
+    });
+
+    it("shows exact impact totals including type-only dependents and entry points", async () => {
+      const dialog = await openReview({
+        ...samplePlan,
+        sourceContext: {
+          ...ctx,
+          impact: {
+            file: "src/types.ts",
+            inGraph: true,
+            maxDepth: 6,
+            maxNodes: 30,
+            directDependencies: 0,
+            directDependents: 4,
+            transitiveDependentsShown: 5,
+            dependentsAtAnyDepth: 10,
+            typeOnlyDependents: 2,
+            entryPointsAffected: 6,
+            truncated: false,
+          },
+        },
+      });
+      expect(dialog.getByText(/planned change target/i)).toHaveTextContent(
+        /In total 10 file\(s\) depend on it at any depth \(2 only through type-only imports\); 6 entry point\(s\) reach it\./,
+      );
+    });
+  });
 });

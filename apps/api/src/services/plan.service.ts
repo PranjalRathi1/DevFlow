@@ -1,3 +1,4 @@
+import { CLAIM_CHECK_LIMITS, checkClaims } from "../lib/claimChecks.js";
 import { Plan, type PlanDocument } from "../models/Plan.js";
 import { Task } from "../models/Task.js";
 import { Requirement } from "../models/Requirement.js";
@@ -16,13 +17,14 @@ import { loadPlanGrounding, type PlanGrounding } from "./planContext.service.js"
 import {
   buildPlanningContext,
   classifyAffectedFiles,
+  claimSourceFor,
   renderPlanningContext,
   type AffectedFileEvidenceSource,
   type PlanningContext,
 } from "../lib/planningContext.js";
 import { fitPlanningContext, FIT_SAFETY_MARGIN_TOKENS } from "../lib/contextFitting.js";
 import { estimatePromptTokens, maxPromptTokens } from "./ai/ollamaProvider.js";
-import { assertObservedFile } from "./impact.service.js";
+import { assertObservedFile, entryPointsOf } from "./impact.service.js";
 import {
   computeImpact,
   impactRelationOf,
@@ -48,7 +50,78 @@ async function getOwnedRequirementInProject(ownerId: string, projectId: string, 
  * path exists in the scan is decided here, never trusted from input.
  */
 function withFileEvidence(tasks: SuggestedTask[], source: AffectedFileEvidenceSource | null) {
-  return tasks.map((task) => ({ ...task, affectedFiles: classifyAffectedFiles(task.affectedFiles, source) }));
+  const claimSource = source ? claimSourceFor(source) : null;
+  const classified = tasks.map((task) => {
+    const affectedFiles = classifyAffectedFiles(task.affectedFiles, source);
+    // Task 3: paths the task's own text names but doesn't list as affected,
+    // and import relationships the text states ("a.ts imports b.ts").
+    const listed = new Set(affectedFiles.map((f) => f.path));
+    const text = [task.description, task.rationale, task.testingApproach, ...task.acceptanceCriteria].join(
+      "\n",
+    );
+    const mentionedPaths = claimSource
+      ? checkClaims(text, undefined, claimSource, CLAIM_CHECK_LIMITS.perTask + listed.size)
+          .filter((c) => c.kind !== "mentions" || !listed.has(c.target))
+          .slice(0, CLAIM_CHECK_LIMITS.perTask)
+      : [];
+    return { ...task, affectedFiles, ...(mentionedPaths.length ? { mentionedPaths } : {}) };
+  });
+  return resolvePlannedCreations(classified);
+}
+
+/**
+ * Task 3: "modify"/"reference" on a path the scan lacks is a contradiction
+ * — unless another task in this plan creates it first. That is consistent
+ * only if the creating task is one this task depends on (directly or
+ * transitively); otherwise the order is unguaranteed and still flagged.
+ */
+function resolvePlannedCreations<T extends { tempId: string; title: string; dependsOn: string[] }>(
+  tasks: (T & { affectedFiles: ReturnType<typeof classifyAffectedFiles> })[],
+) {
+  const creators = new Map<string, string[]>();
+  for (const task of tasks) {
+    for (const f of task.affectedFiles) {
+      if (f.change === "create" && f.evidence !== "in_scan") {
+        creators.set(f.path, [...(creators.get(f.path) ?? []), task.tempId]);
+      }
+    }
+  }
+  const byId = new Map(tasks.map((t) => [t.tempId, t]));
+  const ancestorsOf = (tempId: string) => {
+    const seen = new Set<string>();
+    const stack = [...(byId.get(tempId)?.dependsOn ?? [])];
+    while (stack.length) {
+      const id = stack.pop()!;
+      if (seen.has(id)) continue;
+      seen.add(id);
+      stack.push(...(byId.get(id)?.dependsOn ?? []));
+    }
+    return seen;
+  };
+  return tasks.map((task) => ({
+    ...task,
+    affectedFiles: task.affectedFiles.map((f) => {
+      const makers = (creators.get(f.path) ?? []).filter((id) => id !== task.tempId);
+      // Two tasks both creating one new path: the later ones are flagged.
+      if (f.change === "create" && f.evidence !== "in_scan") {
+        const first = creators.get(f.path)?.[0];
+        return first && first !== task.tempId
+          ? { ...f, conflict: `Also claimed "create" by "${byId.get(first)?.title ?? first}" in this plan` }
+          : f;
+      }
+      if (f.evidence === "in_scan" || (f.change !== "modify" && f.change !== "reference") || !makers.length) {
+        return f;
+      }
+      const ancestors = ancestorsOf(task.tempId);
+      const before = makers.find((id) => ancestors.has(id));
+      if (before) return { ...f, conflict: undefined, plannedBy: before };
+      const titles = makers.map((id) => `"${byId.get(id)?.title ?? id}"`).join(", ");
+      return {
+        ...f,
+        conflict: `Claimed "${f.change}" on a path the scan lacks; ${titles} creates it, but this task does not depend on that task`,
+      };
+    }),
+  }));
 }
 
 /** Adds the verified impact relation lookup to a grounding's evidence source (Stage 4). */
@@ -64,7 +137,7 @@ function evidenceSourceFor(
 /** Same pinned graph + same stored bounds => the same impact as at generation (deterministic). */
 function impactFor(grounding: PlanGrounding, file: string, bounds: { maxDepth: number; maxNodes: number }) {
   assertObservedFile(grounding.scan, file);
-  return computeImpact(grounding.graph, file, bounds);
+  return computeImpact(grounding.graph, file, bounds, { entryPoints: entryPointsOf(grounding.analysis) });
 }
 
 /** Files an impact target makes most relevant — kept first if the context must be cut. */
@@ -75,6 +148,33 @@ function impactPriority(impact: ImpactResult): Set<string> {
     ...impact.directDependents.map((d) => d.file),
     ...impact.transitiveDependents.map((d) => d.file),
   ]);
+}
+
+const RESOLUTION_DIAGNOSTICS_SHOWN = 5;
+
+/** Task 3: which alias configs / packages the analysis used, and their problems (bounded). */
+function resolutionSummaryOf(grounding: PlanGrounding) {
+  const config = grounding.analysis.get("resolutionConfig") as
+    | {
+        aliasScopes?: { configFile: string; patterns: string[]; baseUrl: string | null }[];
+        packages?: unknown[];
+        diagnostics?: { file: string; message: string }[];
+      }
+    | undefined;
+  if (!config) return {};
+  const diagnostics = config.diagnostics ?? [];
+  return {
+    resolution: {
+      aliasConfigs: (config.aliasScopes ?? [])
+        .filter((s) => s.patterns.length > 0 || s.baseUrl !== null)
+        .map((s) => s.configFile),
+      localPackages: (config.packages ?? []).length,
+      diagnosticsTotal: diagnostics.length,
+      diagnostics: diagnostics
+        .slice(0, RESOLUTION_DIAGNOSTICS_SHOWN)
+        .map((d) => ({ file: d.file, message: d.message })),
+    },
+  };
 }
 
 /** `context` is the context the model was actually shown (possibly budget-fitted). */
@@ -90,6 +190,7 @@ function sourceContextFor(grounding: PlanGrounding, context: PlanningContext, im
     coverage: context.coverage,
     focusTerms: context.focus?.terms ?? [],
     focusFiles: context.focus?.files.map((f) => f.path) ?? [],
+    ...resolutionSummaryOf(grounding),
     fitting: context.budget ?? null,
     impact: impact
       ? {
@@ -100,6 +201,9 @@ function sourceContextFor(grounding: PlanGrounding, context: PlanningContext, im
           directDependencies: impact.totals.directDependencies,
           directDependents: impact.totals.directDependents,
           transitiveDependentsShown: impact.transitiveDependents.length,
+          dependentsAtAnyDepth: impact.dependentTotals.all,
+          typeOnlyDependents: impact.dependentTotals.typeOnly,
+          entryPointsAffected: impact.affectedEntryPointsTotal,
           truncated: impact.truncated,
         }
       : null,
@@ -383,6 +487,20 @@ type PlanTask = PlanDocument["suggestedTasks"][number];
  * task can't share references with the plan document, and a field
  * that was absent (e.g. no `change` claimed) stays absent.
  */
+const copyClaim = (c: {
+  kind: string;
+  target: string;
+  subject?: string | null | undefined;
+  status: string;
+  note?: string | null | undefined;
+}) => ({
+  kind: c.kind,
+  target: c.target,
+  ...(c.subject ? { subject: c.subject } : {}),
+  status: c.status,
+  ...(c.note ? { note: c.note } : {}),
+});
+
 function snapshotTaskEvidence(plan: PlanDocument, task: PlanTask) {
   const sc = plan.sourceContext;
   return {
@@ -400,7 +518,10 @@ function snapshotTaskEvidence(plan: PlanDocument, task: PlanTask) {
       ...(f.conflict ? { conflict: f.conflict } : {}),
       ...(f.impactRelation ? { impactRelation: f.impactRelation } : {}),
       ...(f.evidenceNote ? { evidenceNote: f.evidenceNote } : {}),
+      ...(f.plannedBy ? { plannedBy: f.plannedBy } : {}),
+      ...(f.claimChecks?.length ? { claimChecks: f.claimChecks.map(copyClaim) } : {}),
     })),
+    ...(task.mentionedPaths?.length ? { mentionedPaths: task.mentionedPaths.map(copyClaim) } : {}),
     sourceContext: sc
       ? {
           scan: sc.scan,

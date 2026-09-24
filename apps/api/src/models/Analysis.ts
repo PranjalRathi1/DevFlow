@@ -53,6 +53,10 @@ const analysisSchema = new Schema(
       byStatus: { type: Schema.Types.Mixed, default: {} },
     },
     relationships: { type: [relationshipSchema], default: [] },
+    // Task 1 (ADR-028): the resolution configuration this analysis used —
+    // which configs/packages were found and every problem with them.
+    // Absent on analyses made before it existed.
+    resolutionConfig: { type: Schema.Types.Mixed, default: undefined },
     // Only set when outcome === "failed" — a safe, non-leaking description.
     errorMessage: { type: String },
   },

@@ -4,6 +4,7 @@ import { PRIORITY_META, TASK_STATUS_META } from "../../lib/statusMeta";
 import { PRIORITIES, TASK_STATUSES, type Priority, type Task, type TaskStatus } from "../../types/task";
 import type { Requirement } from "../../types/requirement";
 import { AffectedFileList } from "../plans/AffectedFileList";
+import { ClaimCheckList } from "../plans/ClaimCheckList";
 
 interface TaskCardProps {
   task: Task;
@@ -73,6 +74,10 @@ export function TaskCard({
               <AffectedFileList
                 files={task.planEvidence.affectedFiles}
                 label={`Plan evidence files for ${task.title}`}
+              />
+              <ClaimCheckList
+                checks={task.planEvidence.mentionedPaths}
+                label={`Checked statements in the plan text for ${task.title}`}
               />
             </details>
           )}

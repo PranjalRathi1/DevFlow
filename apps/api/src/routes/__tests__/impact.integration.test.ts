@@ -109,6 +109,7 @@ describe.skipIf(!dbAvailable)("GET /api/scans/:id/impact (real MongoDB, real fil
     expect(i.transitiveDependents).toEqual([
       {
         file: "src/app.ts",
+        reach: "runtime",
         depth: 2,
         via: "src/routes.ts",
         evidence: [

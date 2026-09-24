@@ -245,6 +245,67 @@ describe.skipIf(!dbAvailable)("Scan-grounded plan generation (real MongoDB, mock
     expect(prompts[0]).toContain("No scan of the codebase was provided");
   });
 
+  it("accepts 'modify' of a file an earlier task creates; flags unordered edits and duplicate creation (Task 3)", async () => {
+    mockProviderReturning(
+      JSON.stringify({
+        title: "Add a page",
+        summary: "New page.",
+        suggestedTasks: [
+          {
+            tempId: "t1",
+            title: "Create page",
+            dependsOn: [],
+            affectedFiles: [{ path: "src/page.ts", change: "create" }],
+          },
+          {
+            tempId: "t2",
+            title: "Fill page",
+            dependsOn: ["t1"],
+            affectedFiles: [{ path: "src/page.ts", change: "modify" }],
+          },
+          // Transitive: t3 -> t2 -> t1.
+          {
+            tempId: "t3",
+            title: "Style page",
+            dependsOn: ["t2"],
+            affectedFiles: [{ path: "src/page.ts", change: "reference" }],
+          },
+          {
+            tempId: "t4",
+            title: "Unordered edit",
+            dependsOn: [],
+            affectedFiles: [{ path: "src/page.ts", change: "modify" }],
+          },
+          {
+            tempId: "t5",
+            title: "Create it again",
+            dependsOn: [],
+            affectedFiles: [{ path: "src/page.ts", change: "create" }],
+          },
+        ],
+      }),
+    );
+    const res = await generate({ requirementId, scanId }).expect(201);
+    const fileOf = (tempId: string) =>
+      res.body.plan.suggestedTasks.find((t: { tempId: string }) => t.tempId === tempId).affectedFiles[0];
+    expect(fileOf("t1")).toMatchObject({ evidence: "not_in_scan", change: "create" });
+    expect(fileOf("t1")).not.toHaveProperty("conflict");
+    for (const id of ["t2", "t3"]) {
+      expect(fileOf(id)).toMatchObject({ evidence: "not_in_scan", plannedBy: "t1" });
+      expect(fileOf(id)).not.toHaveProperty("conflict");
+    }
+    // The scan still lacks the file: evidence stays "not_in_scan", never "in_scan".
+    expect(fileOf("t4")).toMatchObject({
+      evidence: "not_in_scan",
+      conflict: expect.stringMatching(
+        /"Create page", "Create it again" creates it, but this task does not depend on that task/,
+      ),
+    });
+    expect(fileOf("t4")).not.toHaveProperty("plannedBy");
+    // Two tasks creating one path: the later one is flagged.
+    expect(fileOf("t5")).toMatchObject({ conflict: `Also claimed "create" by "Create page" in this plan` });
+  });
+
   it("rejects an AI plan with an unsafe file path (422) and persists nothing", async () => {
     mockProviderReturning(planJson([{ path: "../../etc/passwd" }]));
     const count = await Plan.countDocuments({ project: projectId });
@@ -578,12 +639,25 @@ describe.skipIf(!dbAvailable)("Scan-grounded plan generation (real MongoDB, mock
 
       // Each task holds a verbatim copy of its plan task's evidence.
       const t1 = approved.createdTasks.find((t: { title: string }) => t.title === "Wrap util in a cache");
+      // Task 3: the rationale's own claim, "src/index.ts imports src/util.ts",
+      // is checked against the confirmed edge — and a path it names is labelled.
+      expect(generated.suggestedTasks[0].mentionedPaths).toEqual([
+        { kind: "mentions", target: "src/index.ts", status: "in_scan" },
+        {
+          kind: "imports",
+          subject: "src/index.ts",
+          target: "src/util.ts",
+          status: "supported",
+          note: "Confirmed import src/index.ts -> src/util.ts (line 1).",
+        },
+      ]);
       expect(t1.planEvidence).toEqual({
         plan: generated._id,
         tempId: "t1",
         rationale: generated.suggestedTasks[0].rationale,
         testingApproach: "Unit test next to util",
         affectedFiles: generatedFiles,
+        mentionedPaths: generated.suggestedTasks[0].mentionedPaths,
         sourceContext: {
           scan: scanId,
           analysis: analysisId,
