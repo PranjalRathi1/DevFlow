@@ -715,7 +715,9 @@ filesystem access path was introduced.
 **4. Resolution rules are deliberately narrow, not "best effort."**
 Only relative specifiers (`./`, `../`) are resolved, in one fixed
 priority order (exact match → `.ts`/`.tsx`/`.js`/`.jsx` extension
-appending → `index.*` in that same order within a matching directory).
+appending → `index.*` in that same order within a matching directory;
+explicit `.js`/`.jsx` specifiers from TypeScript importers were later
+extended by ADR-018).
 Bare specifiers (`react`, `@scope/pkg`) are always `"external"` — never
 inspected against `node_modules`, which doesn't exist in the scan
 inventory at all. Aliases (`@/`, `~/`) and absolute/rooted imports are
@@ -932,3 +934,57 @@ stating the graph "may be incomplete" rather than implying full accuracy.
 matrix; `docs/API_DOCUMENTATION.md` is unchanged — the existing
 `GET /api/scans/:id/graph` contract was already sufficient, no backend
 field was missing.
+
+## ADR-018: NodeNext-compatible relative import resolution (Batch C2.1)
+
+**Context**: Batch C4's real-browser verification scanned this repository's
+own backend (`"moduleResolution": "NodeNext"`) and got 0 confirmed edges
+and 239 unresolved relationships. Under NodeNext, a TypeScript file names
+the extension its target will have after compilation (`./foo.js`), while
+the scanned source is `foo.ts`. ADR-015's resolver only exact-matched an
+explicit extension, so `./foo.js` never found `foo.ts`.
+
+**1. An explicit emitted-extension mapping table, not a blanket rewrite.**
+`lib/importResolution.ts` maps only:
+
+| Specifier ends in | Candidates checked (in this order)      | `resolutionMethod` on a mapped match       |
+| ----------------- | --------------------------------------- | ------------------------------------------ |
+| `.js`             | `foo.js` (literal), `foo.ts`, `foo.tsx` | `nodenext:.js->.ts` / `nodenext:.js->.tsx` |
+| `.jsx`            | `foo.jsx` (literal), `foo.tsx`          | `nodenext:.jsx->.tsx`                      |
+
+A match on the literal file keeps `resolutionMethod: "exact"`. Nothing
+else is mapped: not `.ts`→`.tsx`, not `.js`→`.jsx` (valid only under
+`allowJs`), not `.mjs`/`.cjs`→`.mts`/`.cts`, not `.d.ts` declaration
+targets, and not `./utils.js`→`./utils/index.ts` (NodeNext doesn't do
+directory resolution for an explicit file specifier).
+
+**2. Only TypeScript importers get the mapping.** This is TypeScript
+compiler semantics, so it applies only when the importer is `.ts`, `.tsx`,
+`.mts` or `.cts`. A plain JavaScript importer resolves `./foo.js` to
+`foo.js` or nothing, exactly as before. When the only match is a
+TypeScript counterpart, the `unresolved` reason says so explicitly.
+
+**3. Ambiguity is never broken by precedence.** Every candidate in the row
+is checked. If more than one exists in the scan inventory (e.g. both
+`foo.js` and `foo.ts`, or `foo.ts` and `foo.tsx`), the relationship is
+`unresolved` with an "Ambiguous NodeNext mapping" reason listing the
+conflicting scan-relative paths. TypeScript would type-check against
+`foo.ts` while Node would load `foo.js`, so neither is provably the
+dependency. **Deliberate behavior change:** before C2.1, a TypeScript
+importer's `./foo.js` with both files present was confirmed as `foo.js`.
+Extensionless and index resolution (ADR-015 §4) is unchanged, including
+its `.ts`-first precedence.
+
+**4. The evidence model and graph contract are unchanged.** `rawImport`
+still holds the specifier exactly as written (`./foo.js`),
+`resolvedRelativePath` holds the real file (`src/foo.ts`), and
+`resolutionMethod` records the mapping. No schema, API or frontend field
+was added. Resolution still makes no filesystem calls and checks only the
+scan's frozen inventory. The out-of-root check runs before any mapping,
+so a traversal like `../../secret.js` stays `unsupported` even when
+`secret.ts` exists.
+
+**Consequences**: on this repository, `apps/api/src` goes from 0 confirmed /
+246 unresolved to 246 confirmed / 0 unresolved (all `nodenext:.js->.ts`).
+`apps/web/src` (Bundler resolution, extensionless imports) is identical
+before and after. `docs/TESTING.md` documents the new tests.

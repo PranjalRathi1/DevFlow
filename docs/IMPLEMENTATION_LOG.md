@@ -1895,3 +1895,54 @@ identical to before. All verification browser artifacts (screenshots,
 Playwright debug snapshots) and the test account/project/scan/analysis
 data created for this pass were deleted afterward — nothing from this
 verification was left in the repository or the database.
+
+## 2026-09-24 — Batch C2.1: NodeNext-Compatible Relative Import Resolution
+
+Fixes the resolution gap found during Batch C4's real-browser verification
+(backend scan: 0 confirmed edges, 239 unresolved). Rules and rationale are
+in `docs/DECISIONS.md` ADR-018.
+
+### What changed
+
+- `apps/api/src/lib/importResolution.ts`: a new first resolution step for
+  explicit `.js`/`.jsx` specifiers from TypeScript importers. `.js` checks
+  the literal file plus `.ts` and `.tsx`, and `.jsx` checks the literal
+  file plus `.tsx`. A single match is confirmed (`exact` or
+  `nodenext:<from>-><to>`). Two or more matches are `unresolved` as
+  ambiguous. No matches falls through to the existing rules, with a reason
+  listing the candidates checked. JavaScript importers are unaffected.
+- No change to the `Analysis` schema, graph API, frontend, env, or
+  dependencies.
+
+### Verification
+
+- Real-repo before/after (actual scanner + extractor + resolver, run
+  against `apps/api/src` and `apps/web/src`; no DB writes):
+  - `apps/api/src`: before, 0 confirmed / 246 unresolved / 137 external.
+    After, 246 confirmed (all `nodenext:.js->.ts`) / 0 unresolved / 137
+    external. Every confirmed target is in the scan inventory. (246 rather
+    than C4's 239 because the new C2.1 test files add `.js` imports of
+    their own.)
+  - `apps/web/src`: identical before and after (273 confirmed, 112
+    external, 1 unsupported). No previously confirmed relationship
+    changed in either tree.
+- Focused tests: 109 passed (resolver, source graph, analysis, graph, and
+  the new NodeNext integration test) with MongoDB running.
+- `npm run test --workspace apps/api`: 328 passed, 8 skipped (was 300/8;
+  +25 unit, +3 integration).
+- API typecheck and build pass. `eslint .` gives 0 errors (1 pre-existing,
+  unrelated warning in `apps/web`), and `prettier --check .` passes.
+- Frontend not re-verified: no frontend files changed.
+
+### Known limitations
+
+- Not mapped: `.mjs`/`.cjs`→`.mts`/`.cts`, `.js`→`.jsx`, `.d.ts`
+  declaration targets, tsconfig `paths` aliases, `package.json`
+  `imports`/`exports`.
+- The mapping is keyed to the importer's file extension, not to any
+  tsconfig's `moduleResolution`. A Bundler-mode TypeScript project that
+  writes `./foo.js` also gets it, which is also how TypeScript resolves
+  that specifier in Bundler mode.
+- A literal `foo.js` beside `foo.ts` (for example, compiled output checked
+  in next to its source) is always reported as ambiguous rather than
+  guessed.

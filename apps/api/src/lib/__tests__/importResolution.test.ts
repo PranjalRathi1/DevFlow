@@ -148,3 +148,225 @@ describe("resolveImport — unsupported extensions", () => {
     expect(result.status).toBe("unsupported");
   });
 });
+
+describe("resolveImport — NodeNext emitted-extension mapping (Batch C2.1)", () => {
+  it("maps an explicit .js specifier to the .ts source file", () => {
+    const inv = inventory(["src/lib/util.ts", "src/index.ts"]);
+    const result = resolveImport("src/index.ts", "./lib/util.js", inv);
+    expect(result).toEqual({
+      status: "confirmed",
+      resolvedRelativePath: "src/lib/util.ts",
+      resolutionMethod: "nodenext:.js->.ts",
+    });
+  });
+
+  it("maps an explicit .js specifier to a .tsx source file", () => {
+    const inv = inventory(["src/components/View.tsx"]);
+    const result = resolveImport("src/index.ts", "./components/View.js", inv);
+    expect(result).toMatchObject({
+      status: "confirmed",
+      resolvedRelativePath: "src/components/View.tsx",
+      resolutionMethod: "nodenext:.js->.tsx",
+    });
+  });
+
+  it("maps an explicit .jsx specifier to a .tsx source file", () => {
+    const inv = inventory(["src/Button.tsx"]);
+    const result = resolveImport("src/App.tsx", "./Button.jsx", inv);
+    expect(result).toMatchObject({
+      status: "confirmed",
+      resolvedRelativePath: "src/Button.tsx",
+      resolutionMethod: "nodenext:.jsx->.tsx",
+    });
+  });
+
+  it("maps a parent-directory .js specifier", () => {
+    const inv = inventory(["src/models/Analysis.ts", "src/services/analysis.service.ts"]);
+    const result = resolveImport("src/services/analysis.service.ts", "../models/Analysis.js", inv);
+    expect(result).toMatchObject({ status: "confirmed", resolvedRelativePath: "src/models/Analysis.ts" });
+  });
+
+  it("maps an explicit index.js specifier to the directory's index.ts", () => {
+    const inv = inventory(["src/services/ai/index.ts"], ["src/services/ai"]);
+    const result = resolveImport("src/app.ts", "./services/ai/index.js", inv);
+    expect(result).toMatchObject({
+      status: "confirmed",
+      resolvedRelativePath: "src/services/ai/index.ts",
+      resolutionMethod: "nodenext:.js->.ts",
+    });
+  });
+
+  it("applies the mapping to .mts and .cts importers too", () => {
+    const inv = inventory(["src/util.ts"]);
+    expect(resolveImport("src/a.mts", "./util.js", inv).status).toBe("confirmed");
+    expect(resolveImport("src/a.cts", "./util.js", inv).status).toBe("confirmed");
+  });
+
+  it("confirms a genuinely existing .js file as an exact match when it is the only candidate", () => {
+    const inv = inventory(["src/legacy.js"]);
+    const result = resolveImport("src/index.ts", "./legacy.js", inv);
+    expect(result).toEqual({
+      status: "confirmed",
+      resolvedRelativePath: "src/legacy.js",
+      resolutionMethod: "exact",
+    });
+  });
+
+  it("confirms a genuinely existing .jsx file as an exact match when it is the only candidate", () => {
+    const inv = inventory(["src/Old.jsx"]);
+    const result = resolveImport("src/App.tsx", "./Old.jsx", inv);
+    expect(result).toMatchObject({
+      status: "confirmed",
+      resolvedRelativePath: "src/Old.jsx",
+      resolutionMethod: "exact",
+    });
+  });
+
+  it("does NOT confirm when both the literal .js file and a .ts source exist (conflict)", () => {
+    const inv = inventory(["src/dual.js", "src/dual.ts"]);
+    const result = resolveImport("src/index.ts", "./dual.js", inv);
+    expect(result.status).toBe("unresolved");
+    expect(result.resolvedRelativePath).toBeUndefined();
+    expect(result.resolutionMethod).toBeUndefined();
+    expect(result.reason).toMatch(/ambiguous/i);
+    expect(result.reason).toContain("src/dual.js");
+    expect(result.reason).toContain("src/dual.ts");
+  });
+
+  it("does NOT confirm when both .ts and .tsx sources exist for one .js specifier", () => {
+    const inv = inventory(["src/thing.ts", "src/thing.tsx"]);
+    const result = resolveImport("src/index.ts", "./thing.js", inv);
+    expect(result.status).toBe("unresolved");
+    expect(result.reason).toMatch(/ambiguous/i);
+  });
+
+  it("does NOT confirm when both the literal .jsx file and a .tsx source exist", () => {
+    const inv = inventory(["src/W.jsx", "src/W.tsx"]);
+    const result = resolveImport("src/App.tsx", "./W.jsx", inv);
+    expect(result.status).toBe("unresolved");
+    expect(result.reason).toMatch(/ambiguous/i);
+  });
+
+  it("keeps a missing .js target unresolved and lists the candidates checked", () => {
+    const inv = inventory(["src/other.ts"]);
+    const result = resolveImport("src/index.ts", "./missing.js", inv);
+    expect(result.status).toBe("unresolved");
+    expect(result.resolvedRelativePath).toBeUndefined();
+    expect(result.reason).toMatch(/NodeNext candidates checked: \.js, \.ts, \.tsx/);
+  });
+
+  it("does not map .js to .jsx (allowJs-only behavior is not assumed)", () => {
+    const inv = inventory(["src/Widget.jsx"]);
+    expect(resolveImport("src/index.ts", "./Widget.js", inv).status).toBe("unresolved");
+  });
+
+  it("does not map .jsx to .ts", () => {
+    const inv = inventory(["src/Widget.ts"]);
+    expect(resolveImport("src/App.tsx", "./Widget.jsx", inv).status).toBe("unresolved");
+  });
+
+  it("does not map .mjs/.cjs specifiers to .mts/.cts or .ts", () => {
+    const inv = inventory(["src/esm.mts", "src/esm.ts", "src/cjs.cts"]);
+    expect(resolveImport("src/index.ts", "./esm.mjs", inv).status).toBe("unresolved");
+    expect(resolveImport("src/index.ts", "./cjs.cjs", inv).status).toBe("unresolved");
+  });
+
+  it("does not apply the mapping for a plain JavaScript importer, and says why", () => {
+    const inv = inventory(["src/util.ts"]);
+    for (const importer of ["src/plain.js", "src/plain.jsx", "src/plain.mjs", "src/plain.cjs"]) {
+      const result = resolveImport(importer, "./util.js", inv);
+      expect(result.status).toBe("unresolved");
+      expect(result.reason).toMatch(/TypeScript importers only/);
+    }
+  });
+
+  it("still resolves a real .js file for a plain JavaScript importer exactly as before", () => {
+    const inv = inventory(["src/util.js", "src/util.ts"]);
+    expect(resolveImport("src/plain.js", "./util.js", inv)).toMatchObject({
+      status: "confirmed",
+      resolvedRelativePath: "src/util.js",
+      resolutionMethod: "exact",
+    });
+  });
+
+  it("does not rewrite an explicit .ts specifier to .tsx", () => {
+    const inv = inventory(["src/foo.tsx"]);
+    expect(resolveImport("src/index.ts", "./foo.ts", inv).status).toBe("unresolved");
+  });
+
+  it("leaves extensionless resolution completely unchanged", () => {
+    const inv = inventory(["src/module.ts", "src/module.js"]);
+    expect(resolveImport("src/main.ts", "./module", inv)).toEqual({
+      status: "confirmed",
+      resolvedRelativePath: "src/module.ts",
+      resolutionMethod: "extension:.ts",
+    });
+  });
+
+  it("leaves extensionless directory/index resolution unchanged", () => {
+    const inv = inventory(["src/utils/index.ts"], ["src/utils"]);
+    expect(resolveImport("src/main.ts", "./utils", inv)).toMatchObject({
+      status: "confirmed",
+      resolvedRelativePath: "src/utils/index.ts",
+      resolutionMethod: "index:index.ts",
+    });
+  });
+
+  it("does not guess ./utils.js means ./utils/index.ts", () => {
+    const inv = inventory(["src/utils/index.ts"], ["src/utils"]);
+    expect(resolveImport("src/main.ts", "./utils.js", inv).status).toBe("unresolved");
+  });
+
+  it("rejects a .js path-traversal attempt even if a mapped .ts file would exist", () => {
+    const inv = inventory(["secret.ts"]);
+    const result = resolveImport("src/App.ts", "../../secret.js", inv);
+    expect(result.status).toBe("unsupported");
+    expect(result.reason).toMatch(/outside/i);
+    expect(result.resolvedRelativePath).toBeUndefined();
+  });
+
+  it("does not apply the mapping to alias or bare specifiers ending in .js", () => {
+    const inv = inventory(["src/thing.ts", "chart.ts"]);
+    expect(resolveImport("src/App.ts", "@/thing.js", inv).status).toBe("unsupported");
+    expect(resolveImport("src/App.ts", "chart.js", inv).status).toBe("external");
+  });
+
+  it("never mutates the inventory and is deterministic across repeated calls", () => {
+    const inv = inventory(["src/a.ts", "src/b.tsx", "src/c.js", "src/c.ts"]);
+    const before = [...inv.files];
+    const specs = ["./a.js", "./b.js", "./c.js", "./nope.js"];
+    const first = specs.map((s) => resolveImport("src/index.ts", s, inv));
+    const second = specs.map((s) => resolveImport("src/index.ts", s, inv));
+    expect(second).toEqual(first);
+    expect([...inv.files]).toEqual(before);
+  });
+
+  it("every confirmed result names a file that exists in the scan inventory", () => {
+    const files = [
+      "src/a.ts",
+      "src/b.tsx",
+      "src/c.js",
+      "src/d.jsx",
+      "src/e/index.ts",
+      "src/f.ts",
+      "src/f.js",
+    ];
+    const inv = inventory(files, ["src/e"]);
+    const specs = ["./a.js", "./b.js", "./c.js", "./d.jsx", "./b.jsx", "./e/index.js", "./e", "./f.js"];
+    specs.push("./g.js", "./a", "./b", "./a.ts", "./d.js", "../x.js", "../../x.js");
+    let confirmedCount = 0;
+    for (const importer of ["src/index.ts", "src/index.tsx", "src/index.js"]) {
+      for (const spec of specs) {
+        const result = resolveImport(importer, spec, inv);
+        if (result.status === "confirmed") {
+          confirmedCount += 1;
+          expect(inv.files.has(result.resolvedRelativePath ?? "")).toBe(true);
+          expect(result.resolutionMethod).toBeDefined();
+        } else {
+          expect(result.resolvedRelativePath).toBeUndefined();
+        }
+      }
+    }
+    expect(confirmedCount).toBeGreaterThan(0);
+  });
+});
