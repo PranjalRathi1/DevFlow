@@ -34,13 +34,20 @@ export async function getDependencyGraphForOwner(
   scanId: string,
 ): Promise<ScanDependencyGraph> {
   const scan = await getScanForOwner(ownerId, scanId);
+  const analysis = await findLatestAnalysisOrThrow(ownerId, scan);
+  return buildScanDependencyGraph(scan, analysis);
+}
 
+/** The latest analysis of exactly this scan (the one the Graph tab shows). 404 if none. */
+export async function findLatestAnalysisOrThrow(
+  ownerId: string,
+  scan: ScanDocument,
+): Promise<AnalysisDocument> {
   const analysis = await Analysis.findOne({ scan: scan._id, owner: ownerId }).sort({ createdAt: -1 });
   if (!analysis) {
     throw new AppError("No analysis has been run for this scan yet", 404);
   }
-
-  return buildScanDependencyGraph(scan, analysis);
+  return analysis;
 }
 
 /**
@@ -62,6 +69,7 @@ export function buildScanDependencyGraph(
     importType: r.importType ?? undefined,
     line: r.line ?? undefined,
     column: r.column ?? undefined,
+    typeOnly: r.typeOnly ?? undefined,
     status: r.status,
     resolvedRelativePath: r.resolvedRelativePath ?? undefined,
     resolutionMethod: r.resolutionMethod ?? undefined,

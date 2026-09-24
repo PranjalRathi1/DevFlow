@@ -100,4 +100,63 @@ describe("ProjectTasksTab", () => {
 
     await waitFor(() => expect(taskService.create).toHaveBeenCalledTimes(1));
   });
+
+  it("shows read-only evidence a task inherited from an approved plan", async () => {
+    const fromPlan: Task = {
+      ...parentTask,
+      planEvidence: {
+        plan: "plan-1",
+        tempId: "t1",
+        rationale: "The limiter is imported by the auth route file",
+        testingApproach: "Extend auth.integration.test.ts",
+        affectedFiles: [
+          {
+            path: "src/routes/scan.routes.ts",
+            reason: "attach limiter",
+            change: "modify",
+            evidence: "in_scan",
+            dependentsCount: 1,
+            dependenciesCount: 7,
+          },
+          {
+            path: "src/ghost.ts",
+            reason: "",
+            change: "reference",
+            evidence: "not_in_scan",
+            conflict: 'Claimed "reference", but this path is not in the scan',
+          },
+        ],
+        sourceContext: {
+          scan: "scan-1",
+          analysis: "an-1",
+          contextVersion: 3,
+          impactFile: "src/routes/scan.routes.ts",
+        },
+      },
+    };
+    vi.mocked(taskService.list).mockResolvedValue({ tasks: [fromPlan] });
+    const user = userEvent.setup();
+    renderTab();
+
+    await user.click(await screen.findByText(/from an approved ai plan · grounded in a scan · 2 files/i));
+    expect(screen.getByText(/imported by the auth route file/)).toBeInTheDocument();
+    expect(screen.getByText(/extend auth\.integration\.test\.ts/i)).toBeInTheDocument();
+    const list = screen.getByRole("list", { name: /plan evidence files for implement login/i });
+    expect(list).toHaveTextContent("src/routes/scan.routes.ts");
+    expect(list).toHaveTextContent("In scan");
+    expect(list).toHaveTextContent("imported by 1 · imports 7");
+    expect(list).toHaveTextContent('Claimed "reference", but this path is not in the scan');
+    expect(screen.getByText(/planned change target/i).parentElement).toHaveTextContent(
+      "src/routes/scan.routes.ts",
+    );
+    expect(screen.getByText(/AI rationale:/)).toBeInTheDocument();
+    expect(screen.getByText(/AI testing approach:/)).toBeInTheDocument();
+  });
+
+  it("shows no plan evidence for a manually created task", async () => {
+    vi.mocked(taskService.list).mockResolvedValue({ tasks: [parentTask] });
+    renderTab();
+    await screen.findByText("Implement login");
+    expect(screen.queryByText(/from an approved ai plan/i)).not.toBeInTheDocument();
+  });
 });

@@ -20,6 +20,7 @@ interface RelationshipInput {
   importType?: string | undefined;
   line?: number | undefined;
   column?: number | undefined;
+  typeOnly?: boolean | undefined;
   status: RelationshipStatus;
   resolvedRelativePath?: string | undefined;
   resolutionMethod?: string | undefined;
@@ -138,6 +139,7 @@ export async function runAnalysisForOwner(ownerId: string, scanId: string): Prom
         importType: site.importType,
         line: site.line,
         column: site.column,
+        ...(site.typeOnly ? { typeOnly: true } : {}),
         status: resolved.status,
         resolvedRelativePath: resolved.resolvedRelativePath,
         resolutionMethod: resolved.resolutionMethod,

@@ -37,6 +37,14 @@ export interface ExtractedImportSite {
   line: number;
   /** 1-based. */
   column: number;
+  /**
+   * Stage 5: true only when the SYNTAX guarantees the import is erased
+   * from emitted JavaScript under every compiler setting: `import type`,
+   * `export type ... from`, and type-position `import("...")`. Absent
+   * does not mean "used at runtime". `import { type A }` is deliberately
+   * NOT marked: under `verbatimModuleSyntax` it still loads the module.
+   */
+  typeOnly?: boolean;
 }
 
 export interface ExtractionResult {
@@ -90,10 +98,12 @@ function pushLiteralOrSnippet(
   node: ts.Node,
   importType: ImportType,
   argument: ts.Expression | undefined,
+  typeOnly = false,
 ): void {
   const { line, column } = locationOf(sourceFile, node);
+  const flag = typeOnly ? { typeOnly: true } : {};
   if (argument && ts.isStringLiteralLike(argument)) {
-    sites.push({ rawImport: argument.text, isLiteral: true, importType, line, column });
+    sites.push({ rawImport: argument.text, isLiteral: true, importType, line, column, ...flag });
     return;
   }
   const snippetSource = argument ?? node;
@@ -103,6 +113,7 @@ function pushLiteralOrSnippet(
     importType,
     line,
     column,
+    ...flag,
   });
 }
 
@@ -129,9 +140,17 @@ export function extractImports(sourceText: string, language: SupportedExtraction
   try {
     const visit = (node: ts.Node): void => {
       if (ts.isImportDeclaration(node)) {
-        pushLiteralOrSnippet(sites, sourceFile, node, "import", node.moduleSpecifier);
+        const typeOnly = node.importClause?.isTypeOnly === true;
+        pushLiteralOrSnippet(sites, sourceFile, node, "import", node.moduleSpecifier, typeOnly);
       } else if (ts.isExportDeclaration(node) && node.moduleSpecifier) {
-        pushLiteralOrSnippet(sites, sourceFile, node, "export_from", node.moduleSpecifier);
+        pushLiteralOrSnippet(sites, sourceFile, node, "export_from", node.moduleSpecifier, node.isTypeOnly);
+      } else if (ts.isImportTypeNode(node)) {
+        // `typeof import("./x.js")` / `import("./x.js").T` — a compile-time
+        // reference that previously produced no relationship at all.
+        const arg = node.argument;
+        const literal =
+          ts.isLiteralTypeNode(arg) && ts.isStringLiteral(arg.literal) ? arg.literal : undefined;
+        pushLiteralOrSnippet(sites, sourceFile, node, "import", literal, true);
       } else if (ts.isCallExpression(node)) {
         if (node.expression.kind === ts.SyntaxKind.ImportKeyword) {
           pushLiteralOrSnippet(sites, sourceFile, node, "dynamic_import", node.arguments[0]);

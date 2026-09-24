@@ -17,12 +17,14 @@ import { LoadingState } from "../../components/ui/LoadingState";
 import { ErrorState } from "../../components/ui/ErrorState";
 import { EmptyState } from "../../components/ui/EmptyState";
 import { SelectField } from "../../components/forms/SelectField";
-import { AFFECTED_FILE_EVIDENCE_META, PLAN_STATUS_META, PRIORITY_META } from "../../lib/statusMeta";
+import { PLAN_STATUS_META, PRIORITY_META } from "../../lib/statusMeta";
+import { AffectedFileList } from "../../components/plans/AffectedFileList";
 import { errorMessage } from "../../lib/errorMessage";
 import { useLatestScan } from "../../queries/scanQueries";
+import { useDependencyGraph } from "../../queries/graphQueries";
 import type { Plan } from "../../types/plan";
 
-function PlanEvidenceSummary({ plan }: { plan: Plan }) {
+function PlanEvidenceSummary({ plan, latestScanId }: { plan: Plan; latestScanId: string | undefined }) {
   const ctx = plan.sourceContext;
   if (!ctx) {
     return (
@@ -32,8 +34,23 @@ function PlanEvidenceSummary({ plan }: { plan: Plan }) {
     );
   }
   const c = ctx.counts;
+  const cov = ctx.coverage;
+  const coverageGaps = cov ? cov.unreadDirectories - cov.ignoredDirectories : 0;
+  const stale = latestScanId !== undefined && latestScanId !== ctx.scan;
+  const impact = ctx.impact;
+  const targetReferenced =
+    impact && plan.suggestedTasks.some((t) => (t.affectedFiles ?? []).some((f) => f.path === impact.file));
   return (
     <div className="rounded-md border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-600">
+      {stale && (
+        <p role="note" className="mb-2 flex items-start gap-1 text-warning-800">
+          <AlertTriangle className="mt-0.5 h-3 w-3 shrink-0" aria-hidden="true" />
+          <span>
+            A newer scan of this project exists. This plan&apos;s evidence is from the older scan below and
+            may no longer match the code.
+          </span>
+        </p>
+      )}
       <p className="font-semibold text-slate-700">
         Grounded in scan
         {ctx.scanCreatedAt ? ` from ${new Date(ctx.scanCreatedAt).toLocaleString()}` : ""}
@@ -46,6 +63,35 @@ function PlanEvidenceSummary({ plan }: { plan: Plan }) {
       {ctx.truncated && (
         <p className="mt-1">Some evidence lists were truncated for the AI; the totals above are exact.</p>
       )}
+      {cov && (cov.stoppedEarly.length > 0 || coverageGaps > 0) && (
+        <p className="mt-1 text-warning-800">
+          The scan was incomplete
+          {cov.stoppedEarly.length > 0 ? ` (stopped early: ${cov.stoppedEarly.join(", ")})` : ""};{" "}
+          {cov.unreadDirectories} directories were not read. Files there are labelled unverified, not absent.
+        </p>
+      )}
+      {impact && (
+        <p className="mt-1">
+          Planned change target: <code>{impact.file}</code> — {impact.directDependents} direct dependents,{" "}
+          {impact.transitiveDependentsShown} indirect dependents shown to the AI (within {impact.maxDepth}{" "}
+          import hops){impact.truncated ? "; the impact was cut off, so more files may be affected" : ""}.
+          Dependents may be affected; they do not all need to change.
+          {!targetReferenced && " No task in this plan references the target file."}
+        </p>
+      )}
+      {ctx.focusTerms && ctx.focusTerms.length > 0 && (
+        <p className="mt-1">
+          Requirement focus (matched by file name only, not proof of relevance):{" "}
+          {ctx.focusFiles && ctx.focusFiles.length > 0 ? ctx.focusFiles.join(", ") : "no matching files"}
+        </p>
+      )}
+      <p className="mt-2 text-slate-500">
+        File labels are checked by DevFlow against this scan: <strong>In scan</strong> = the scan saw the
+        file; <strong>Not in scan — proposed</strong> = the scan looked there and did not find it;{" "}
+        <strong>Unverified</strong> = DevFlow could not check (the scan did not read that location). Import
+        relationships show references between files, not how code runs. The AI&apos;s intent, reasons and
+        rationale are its own claims.
+      </p>
     </div>
   );
 }
@@ -56,6 +102,11 @@ export default function ProjectPlansTab() {
   const { data: latestScan } = useLatestScan(project._id);
   const groundableScan = latestScan && latestScan.outcome !== "failed" ? latestScan : null;
   const [useScanContext, setUseScanContext] = useState(true);
+  const [impactFile, setImpactFile] = useState("");
+  // Files the latest scan's analysis knows about — the only valid impact targets.
+  const { data: graph } = useDependencyGraph(
+    groundableScan && useScanContext ? groundableScan._id : undefined,
+  );
   const { data: aiStatus } = useAIStatus();
   const { data: plans, isLoading, isError, error, refetch } = usePlans(project._id);
   const generatePlan = useGeneratePlan(project._id);
@@ -109,6 +160,7 @@ export default function ProjectPlansTab() {
                 {
                   requirementId: selectedRequirementId,
                   scanId: groundableScan && useScanContext ? groundableScan._id : undefined,
+                  impactFile: groundableScan && useScanContext && impactFile ? impactFile : undefined,
                 },
                 { onError: (err) => setGenerateError(errorMessage(err, "Failed to generate a plan.")) },
               );
@@ -127,7 +179,26 @@ export default function ProjectPlansTab() {
             Ground the plan in the latest scan ({new Date(groundableScan.createdAt).toLocaleString()}) and its
             dependency analysis
           </label>
-        ) : (
+        ) : null}
+        {groundableScan && useScanContext && graph && graph.nodes.length > 0 && (
+          <div className="mt-3 max-w-xl">
+            <SelectField
+              label="File you plan to change (optional)"
+              name="impactFile"
+              options={[
+                { value: "", label: "No specific file" },
+                ...graph.nodes.map((n) => ({ value: n.id, label: n.id })),
+              ]}
+              value={impactFile}
+              onChange={(e) => setImpactFile(e.target.value)}
+            />
+            <p className="mt-1 text-xs text-slate-500">
+              Adds the files that import it (directly or indirectly) to the AI&apos;s context as possibly
+              affected.
+            </p>
+          </div>
+        )}
+        {!groundableScan && (
           <p className="mt-2 text-xs text-slate-500">
             No usable scan yet — the plan will not be grounded in project evidence. Run a scan and its
             dependency analysis first for an evidence-backed plan.
@@ -205,7 +276,7 @@ export default function ProjectPlansTab() {
               </span>
             </div>
 
-            <PlanEvidenceSummary plan={reviewingPlan} />
+            <PlanEvidenceSummary plan={reviewingPlan} latestScanId={latestScan?._id} />
 
             {reviewingPlan.assumptions.length > 0 && (
               <div>
@@ -248,31 +319,18 @@ export default function ProjectPlansTab() {
                       {task.description && <p className="mt-1 text-sm text-slate-500">{task.description}</p>}
                       {task.rationale && (
                         <p className="mt-1 text-xs text-slate-500">
-                          <span className="font-semibold">Rationale:</span> {task.rationale}
+                          <span className="font-semibold">AI rationale:</span> {task.rationale}
                         </p>
                       )}
-                      {task.affectedFiles && task.affectedFiles.length > 0 && (
-                        <ul
-                          className="mt-2 flex flex-col gap-1"
-                          aria-label={`Affected files for ${task.title}`}
-                        >
-                          {task.affectedFiles.map((file) => {
-                            const evidence = AFFECTED_FILE_EVIDENCE_META[file.evidence];
-                            return (
-                              <li key={file.path} className="flex flex-wrap items-center gap-2 text-xs">
-                                <code className="break-all text-slate-700">{file.path}</code>
-                                <Badge tone={evidence.tone}>{evidence.label}</Badge>
-                                {file.dependentsCount !== undefined && (
-                                  <span className="text-slate-400">
-                                    imported by {file.dependentsCount} · imports {file.dependenciesCount ?? 0}
-                                  </span>
-                                )}
-                                {file.reason && <span className="text-slate-500">— {file.reason}</span>}
-                              </li>
-                            );
-                          })}
-                        </ul>
+                      {task.testingApproach && (
+                        <p className="mt-1 text-xs text-slate-500">
+                          <span className="font-semibold">AI testing approach:</span> {task.testingApproach}
+                        </p>
                       )}
+                      <AffectedFileList
+                        files={task.affectedFiles ?? []}
+                        label={`Affected files for ${task.title}`}
+                      />
                       {task.dependsOn.length > 0 && (
                         <p className="mt-1 text-xs text-slate-400">
                           Depends on:{" "}
@@ -288,6 +346,17 @@ export default function ProjectPlansTab() {
             {reviewError && (
               <p role="alert" className="text-sm text-red-600">
                 {reviewError}
+              </p>
+            )}
+
+            {reviewingPlan.status !== "needs_review" && (
+              <p className="text-xs text-slate-500">
+                {reviewingPlan.status === "approved"
+                  ? "Approved — its tasks were created with a copy of this evidence."
+                  : "Rejected — no tasks were created."}
+                {reviewingPlan.reviewedAt
+                  ? ` Reviewed ${new Date(reviewingPlan.reviewedAt).toLocaleString()}.`
+                  : ""}
               </p>
             )}
 

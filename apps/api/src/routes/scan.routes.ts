@@ -3,8 +3,9 @@ import * as scanController from "../controllers/scan.controller.js";
 import * as analysisController from "../controllers/analysis.controller.js";
 import * as graphController from "../controllers/graph.controller.js";
 import { requireAuth } from "../middleware/auth.middleware.js";
-import { validateBody } from "../middleware/validate.js";
+import { validateBody, validateQuery } from "../middleware/validate.js";
 import { configureSourceSchema } from "../validators/scan.validators.js";
+import { impactQuerySchema } from "../validators/impact.validators.js";
 import { asyncHandler } from "../utils/asyncHandler.js";
 
 // Mounted at /api/projects/:projectId/source — same explicit-prefix
@@ -35,3 +36,6 @@ scanByIdRouter.get("/:id/analysis", asyncHandler(analysisController.getAnalysis)
 // latest analysis; see services/graph.service.ts for why no separate
 // graph model is persisted.
 scanByIdRouter.get("/:id/graph", asyncHandler(graphController.getGraph));
+// Stage 3 (ADR-022) — read-only change impact for one file, over the same
+// canonical graph as /graph.
+scanByIdRouter.get("/:id/impact", validateQuery(impactQuerySchema), asyncHandler(graphController.getImpact));

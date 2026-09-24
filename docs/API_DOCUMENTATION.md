@@ -233,9 +233,72 @@ All routes require the auth cookie. Ownership follows the same
 denormalized-`owner` pattern as Requirements/Tasks. See `docs/AI_SYSTEM.md`
 for the full generation/validation/approval workflow.
 
+### `GET /api/scans/:id/impact?file=<path>[&maxDepth=n][&maxNodes=n]`
+
+Read-only change impact for one file (ADR-022), computed over the same
+canonical graph as `/graph` (the scan's latest analysis). There is no AI
+call, no rescan, no reanalysis and no filesystem access.
+
+Edges point **importer → imported**:
+
+- `directDependencies`: files the selected file imports.
+- `directDependents`: files that import it.
+- `transitiveDependents`: files that reach it through two or more
+  confirmed imports. Each entry has a `depth` and a `via` (the next file
+  on the shortest path), plus the evidence of that hop.
+
+A change to the file _may_ affect its dependents. Its dependencies are not
+implied to be affected. Only confirmed edges appear in these lists. The
+file's own unresolved, external and unsupported imports are returned
+separately in `nonConfirmedImports` and never count as impact.
+`untraceable` gives whole-scan counts of relationships that could hide
+more dependents, and `limitations` states that import edges don't prove
+runtime usage.
+
+- `file` follows the same path rules as AI-proposed paths: absolute,
+  drive-letter and `..` paths are rejected with `400`.
+- `maxDepth` (default 10, max 25) and `maxNodes` (default 200, max 1000)
+  bound the traversal and each direct list. `totals` gives the exact
+  direct counts, and `truncated` is `true` whenever a bound cut anything.
+- `cycles`: at most 10 proven cycles that include the file, each
+  `{ files, length, truncated }` with `files` cut to 50. `cyclesTotal` gives
+  the exact number of such cycles.
+- `nonConfirmedImports.{unresolved,external,unsupported}`: each capped at
+  `maxNodes`; `nonConfirmedImports.totals` gives the exact counts.
+- `scanLimitsReached`: walk-stopping scan limits (e.g. `maxFiles`). If it
+  isn't empty, dependents may be missing entirely.
+- `inGraph: false` for scanned files outside the analysed languages (e.g.
+  `.css`): there is no import data for them, which is not the same as
+  "no impact".
+- `200` `{ "impact": { scanId, analysisId, analysisCreatedAt, file, ... } }`.
+- `400` — unsafe or missing path, out-of-range bounds, or an invalid scan id.
+- `401` — not authenticated.
+- `404` — scan not found or not yours, no analysis for the scan, or the
+  file isn't a file this scan observed. Near matches are never guessed.
+
 ### `POST /api/projects/:projectId/plans/generate`
 
 Request: `{ "requirementId": string, "scanId"?: string }`.
+
+Optional `impactFile` (requires `scanId`; same path rules; `400` if unsafe
+or given without `scanId`, `404` if it isn't a file this scan observed,
+checked before any AI call). The target's bounded change impact (ADR-023,
+depth 6, 30 files) is added to the prompt, and `sourceContext.impact`
+records what the model was shown. Each in-scan affected file then gets a
+server-verified `impactRelation`: `target`, `dependency`,
+`direct_dependent`, `transitive_dependent`, or
+`dependency_and_dependent` (a cycle). Absent means the file was not found
+within the bounded impact, which is _not_ the same as unrelated. An
+`impactRelation` supplied by the AI or a client is ignored.
+
+C5.1 additions (all optional in AI output, so older plans stay valid):
+each suggested task can have a `testingApproach`; each affected file can
+have `change` (`"modify" | "create" | "test" | "reference"`, default
+`"modify"`) as the AI's _claim_. The server adds `conflict` when the claim
+contradicts the scan (for example `"create"` on an existing file, or
+`"modify"`/`"reference"` on a path that isn't in the scan). A grounded
+plan's `sourceContext` also records `focusTerms` and `focusFiles`: the
+lexical requirement focus the model was shown.
 
 With `scanId` (Batch C5), the plan is grounded in that scan and its latest
 dependency analysis. The prompt gets a bounded, deterministic summary of
@@ -284,7 +347,12 @@ Request: any subset of `{ "title", "summary", "assumptions", "risks", "suggested
 - `200` `{ "plan": {...}, "createdTasks": [...] }` — status becomes
   `"approved"`; `suggestedTasks` are materialized into real `Task`
   documents with `dependencies` resolved from the plan's `dependsOn`
-  tempIds to real ObjectIds.
+  tempIds to real ObjectIds. Each created task carries `planEvidence`
+  (C5.1): `{ plan, tempId, rationale, testingApproach, affectedFiles,
+sourceContext: { scan, analysis, contextVersion } | null }`. It is an
+  exact copy of that plan task's evidence at approval time: nothing is
+  re-scanned, re-analysed or re-derived. Task create and update ignore
+  `planEvidence` in the request body.
 - `409` — already reviewed. `400`/`404` as above.
 
 ### `POST /api/plans/:id/reject`

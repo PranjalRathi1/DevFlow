@@ -1074,3 +1074,278 @@ load/total durations. Prompt and response text are never logged.
 **Result**: re-validated with the real model. HTTP 201 in 24 s, a
 4,663-token prompt in a 16,384-token context, no truncation, 820 output
 tokens.
+
+## ADR-021: Requirement-focused planning context and evidence through approval (C5.1)
+
+**Problem**: In the first successful real run (ADR-020), the model had the
+full dependency list but still put rate limiting in controllers, even
+though the existing limiter is imported by a route file
+(`auth.routes.ts`). It suggested only manual testing and left assumptions
+and risks empty. Separately, approving a plan created tasks without any of
+the plan's evidence.
+
+**1. A requirement focus section, deterministic and honestly labelled.**
+`buildRequirementFocus` (lib/planningContext.ts) picks up to 12 non-test
+files whose **path** shares a word with the requirement. It uses a small
+stemmer, stopwords (function words only), and prefix matching with a
+4-character minimum; title words count double. The prompt states outright
+that this is a lexical match, not proof of relevance. For each file it
+shows, **from confirmed edges only**:
+
+- its importers and imports, with statement line numbers (bounded)
+- the test files that reach it through confirmed imports, within 6 hops.
+  Only reachability is evidence; the order among those tests is lexical.
+
+It also says that import edges do not show how a symbol is used.
+Unresolved, external and unsupported imports never appear here. Context
+version is now 3. On DevFlow's own backend the grounded prompt went from
+4,565 to 6,857 tokens (measured exactly with qwen2.5's tokenizer), well
+inside ADR-020's budget.
+
+_Alternatives rejected_: sending source code (unbounded, and a
+confidentiality/prompt-size risk); inferring layers from directory names
+and presenting them as fact (filename inference); embeddings or semantic
+search (a new dependency, non-deterministic).
+
+**2. Prompt guidance and schema.** The prompt tells the model to follow the
+layer of an existing similar file's importers, to name route files for
+endpoint work, to prefer extending tests that reach the changed file, to
+quote line numbers only from the context, and to state at least one
+assumption and one risk. New optional AI fields: `testingApproach` per
+task, and `change` per file. They are optional so a response without them
+still validates; the unsafe-path policy is unchanged.
+
+**3. Claims versus evidence.** `change` is stored as the AI's claim. The
+server sets `conflict` when the scan contradicts it, and never changes the
+server's `evidence` label because of a claim.
+
+**4. Evidence through approval.** Approval copies each plan task's
+rationale, testing approach and affected files (labels, counts, conflicts)
+into `Task.planEvidence`, together with the plan id and the scan/analysis
+ids. It is copied, never re-derived: there is no rescan or reanalysis, and
+approval cannot create evidence the reviewed plan didn't have. Task
+create and update schemas don't accept it (Zod strips unknown keys). The
+plan keeps its own evidence after approval or rejection.
+
+**5. Groundwork for change-impact analysis.** `getTransitiveDependents`
+(lib/sourceDependencyGraph.ts) walks incoming confirmed edges
+breadth-first over the existing canonical graph. It is bounded
+(`maxDepth`, `maxNodes`, with a `truncated` flag), cycle-safe, and
+deterministic (level order, ids sorted, first `via` wins). There is no
+second graph and edge direction is unchanged. A future impact API can be
+built on it: select a file, then return its direct and transitive
+dependents with depth and `via`, the edge evidence for each hop (already
+on `GraphEdge.evidence`), and the file's non-confirmed imports listed
+separately.
+
+**Security/determinism**: no new filesystem access, no new dependency, and
+no source code sent to the model. All additions are pure functions of
+stored scan and analysis data plus the requirement text.
+
+**Real-model result** (qwen2.5:7b, same requirement as ADR-020): the plan
+now targets `routes/scan.routes.ts`, references the existing limiter
+file as its pattern, extends the existing `scan`/`analysis` integration
+tests, and states an assumption and a risk. It also proposed a
+non-existent `routes/analysis.routes.ts`; the server labelled it
+`not_in_scan` with a `conflict`. Error handling was still placed in
+controllers.
+
+## ADR-022: Lifecycle atomicity, intent claims, and read-only change impact
+
+**1. Atomic review transitions (defect found in Stage 1).** Approve,
+reject and edit each read the status and then saved it. A concurrent-request
+test showed three simultaneous approvals all returning 200 (tasks created
+three times), and an approval and a rejection both succeeding. Each
+transition now claims the plan with a conditional `findOneAndUpdate` that
+matches only `status: "needs_review"`, so exactly one caller wins and the
+others get 409. Edits carry the same condition. If task creation fails
+after a claim, the created tasks are deleted and the claim is released:
+this single-node MongoDB has no replica set, so there are no multi-document
+transactions.
+_Alternative rejected_: a new `"approving"` status, which would add a
+state to the product for a purely internal reason.
+
+**2. No fabricated intent.** `change` used to default to `"modify"` in the
+validator and the schema. That displayed an intent the AI never stated,
+including on every C5-era plan read from the database, and could raise a
+`conflict` about a claim that was never made. There is no default now;
+an omitted intent stays absent through generation, storage and approval.
+
+**3. Change impact** (`lib/impactAnalysis.ts`,
+`GET /api/scans/:id/impact`). This is a pure function over the canonical
+graph, reusing `getTransitiveDependents` and `GraphEdge.evidence`; there
+is no second graph. Direction is importer → imported. Direct
+dependencies, direct dependents, and transitive dependents (depth ≥ 2,
+with `via` and the evidence of that hop) are kept separate. A self-import
+is reported apart from the lists and never as the file's own dependent.
+Proven cycles that include the file are listed. Ordering is deterministic.
+Both the traversal and the direct lists are capped (a hub file with 3,000
+importers stays bounded), with exact totals and a `truncated` flag.
+Non-confirmed imports and whole-scan untraceable counts are reported
+separately, so a missing dependent can be explained rather than hidden.
+Checked by hand against DevFlow's own backend:
+`rateLimit.middleware.ts` → sole importer `routes/auth.routes.ts:6`,
+matching `grep`.
+_Not claimed_: runtime impact, symbol usage, route registration or
+middleware order.
+
+## ADR-023: Impact-aware planning (Stage 4)
+
+**Problem**: The requirement focus (ADR-021) chooses files by name. A user
+who knows which file they will change had no way to put that file's
+dependents, as proven by the graph, in front of the model.
+
+**Decision**: `generate` takes an optional `impactFile`. It is validated
+against the scan before any AI call. The server computes its impact with
+`computeImpact` (ADR-022) using planning bounds (depth 6, 30 files) and
+appends a CHANGE IMPACT section to the prompt. That section says:
+
+- dependents _may_ be affected, which does not mean they must change
+- the target's own dependencies are not implied to be affected
+- when the impact was truncated, and that the test search was bounded
+- that import edges don't prove runtime use
+
+Each in-scan affected file gets a server-computed `impactRelation`. When a
+file both imports the target and is imported by it (a cycle), it is
+labelled `dependency_and_dependent`, so neither role hides the other. A
+test caught the first version returning just `dependency`. Relations are
+recomputed from the pinned analysis and stored bounds on edit, and copied
+verbatim at approval together with `impactFile`.
+
+**Budget, measured exactly with qwen2.5's tokenizer on DevFlow's own
+backend, impact target `scan.service.ts`**: the impact section is 740
+tokens; the whole prompt is 7,699 tokens against a 12,288-token prompt
+budget, and the guard estimate is 10,168. A depth of 4 was tried first; it
+missed the app-level integration tests, which sit 5 hops out. A project
+that fills every context cap _and_ declares an impact target can exceed
+the budget; the ADR-020 guard then returns 422 without sending anything.
+
+**Real-model observation (one run; not a general result)**: HTTP 201 in
+27 s; 8,178 prompt tokens, no truncation; 0 relation or label mismatches
+against an independent BFS. The model did not treat dependents as
+must-change, but it also didn't touch its own declared target and again
+edited controllers. The server's `dependency` labels on those controllers
+make that visible to the reviewer.
+
+## ADR-024: Analysis accuracy hardening (Stage 5)
+
+Each item below started as a probe or a failing test on real behaviour,
+not as a theoretical improvement.
+
+**1. Scan coverage: a missing path is not an absent file.** The scanner
+stops walking when it hits `maxFiles` or `maxDurationMs`. It records
+directories it didn't read: ignored names such as `node_modules`/`dist`,
+depth or directory limits, and read errors. It records symlinks as
+placeholders it never follows. Before this change, any AI-proposed path
+missing from the inventory was labelled `not_in_scan` ("proposed"),
+including real files the scan never looked at, and a "modify" claim on
+such a file got a false conflict. Now:
+
+- a path inside or at an unread directory or symlink is `unverified`, with
+  an `evidenceNote` saying why
+- after a walk-stopping limit, every unobserved path is `unverified`
+- `not_in_scan` is used only where the scan actually looked
+
+The planning context states the scan's coverage (complete, or INCOMPLETE
+with the reasons). Ignored directories are reported, but alone they don't
+make a scan "incomplete". `sourceContext.coverage` records it, and the
+impact API returns `scanLimitsReached`.
+
+**2. Type-only imports.** `import type`, `export type … from`, and
+type-position `import("…")` now set `typeOnly: true` on the extracted
+site, the stored relationship, graph edge evidence and impact evidence.
+Type-position imports were previously not extracted at all: 5 missing
+edges in DevFlow's own backend, out of 23 type-only sites and 319 relative
+import sites. They're real compile-time dependencies (still confirmed
+edges), but they're erased at runtime, and the impact prompt marks a
+neighbour whose every statement is type-only. `import { type A }` is
+deliberately _not_ marked: under `verbatimModuleSyntax` it still loads the
+module. An absent flag never means "proven runtime".
+Analyses stored before this change have no flag; re-run the analysis to
+get it.
+
+**3. Resolver fixes, each with a regression test:**
+
+- A specifier containing `\` (e.g. `.\foo`) was classified as an
+  _external package_. It is now `unsupported` with a reason: backslash
+  separators are platform-specific and not valid in ESM.
+- A trailing-slash specifier (`./lib/`) never resolved. It now resolves
+  through index files only, and never to a sibling file `lib.ts`.
+- A letter-case mismatch stays `unresolved` (it would fail on
+  case-sensitive systems), but the reason now names the case-mismatched
+  file, so the gap is explained rather than silent.
+
+Real-repo regression check (HEAD resolver vs new, on `apps/api/src` and
+`apps/web/src`): identical, with 319 and 283 confirmed and no confirmed
+edge changed.
+
+**4. Deliberately not implemented: validating free-text claims.**
+Checking prose such as "A imports B" or "this test covers X" with string
+matching would produce confident-looking false results. Prose stays
+explicitly the AI's claim. The server validates only structured fields:
+paths, labels, change intent, impact relations and coverage.
+
+**Known remaining limits**:
+
+- import-based only (no symbol usage, route registration, middleware
+  order, dependency injection or dynamic loading)
+- tsconfig `paths` aliases are unsupported
+- `package.json` `exports`/`imports` and workspace packages are not resolved
+- focus selection is lexical, and says so
+
+## ADR-025: Boundaries and performance (Stage 7)
+
+**Measured on a synthetic graph at the scanner's file cap (2,000 files,
+6,000 edges, many long cycles):**
+
+- Building the context, the focus section and file labels takes 281 ms,
+  with every list capped and truncation stated.
+- Impact on a 3,000-node chain or fan-in stays under the 2 s test bound.
+
+**Defect found and fixed:** only the _number_ of cycles was capped, not
+their _length_. The context's cycles section reached 404,468 characters
+(10 cycles of about 1,400 files each), and the impact API returned all
+1,611 cycles containing the file, uncapped. Now:
+
+- the context shows at most 12 files per cycle, stating how many were cut
+- the impact API returns at most 10 cycles of at most 50 files each, plus
+  the exact `cyclesTotal`
+- both set `truncated`
+
+The ADR-020 guard had already refused the oversized prompt with a 422, so
+nothing was ever silently cut or sent.
+
+**Remaining limitation (measured, not fixed):** at every context cap (300
+files, 400 edges, 50 unresolved, 12 focus files, 10 cycles), the
+grounded prompt is about 72k characters, a guard estimate of about 24k
+tokens, against a 12,288-token budget at `OLLAMA_NUM_CTX=16384`. Very
+large projects therefore get an explicit 422 today. DevFlow's own backend
+(about 100 files) uses 7.7k tokens. The recommended next step is
+budget-aware deterministic fitting: shrink the lowest-priority lists
+(files already covered by focus and edges first) in a fixed order until
+the prompt fits, and say what was dropped. The alternative is raising
+`OLLAMA_NUM_CTX`, whose memory cost has to be accepted knowingly.
+
+## ADR-026: Independent review before commit — findings
+
+A review of the uncommitted C5.1 and Stage 1–8 work, done before it was
+committed. Each finding was reproduced with a failing test before it was
+fixed. The strength of the existing tests was checked by reintroducing
+defects on purpose: a fabricated `"modify"` default, ignored scan
+coverage, the server trusting AI-supplied labels and relations, and
+dropped evidence at approval. Between 4 and 7 tests failed for each.
+
+1. **Approval compensation could strand a plan (medium).** If the
+   compensating task deletion failed, it replaced the original error and
+   the plan stayed `"approved"` with only part of its tasks, and could never
+   be reviewed again. Now each cleanup step is best-effort and logged, the
+   claim is always released, and the original error is rethrown. The next
+   approval also removes tasks left over from an earlier failed attempt:
+   the claim only succeeds from `needs_review`, so such tasks can only be
+   leftovers. A plan therefore ends with exactly one task set.
+2. **Unbounded list in the impact response (low).** The file's own
+   non-confirmed imports were returned uncapped. They are now capped at
+   `maxNodes`, with exact `totals`, and the impact prompt uses the totals so
+   its counts stay exact.
+3. **AI-authored testing approach shown unlabelled (low).** It is now
+   labelled as the AI's, like the rationale and reasons.

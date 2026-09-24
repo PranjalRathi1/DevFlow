@@ -1,4 +1,9 @@
-import type { DependencyGraphResult, NonConfirmedRelationship } from "./sourceDependencyGraph.js";
+import type { ImpactRelation } from "./impactAnalysis.js";
+import {
+  getTransitiveDependents,
+  type DependencyGraphResult,
+  type NonConfirmedRelationship,
+} from "./sourceDependencyGraph.js";
 
 /**
  * Batch C5 — deterministic, bounded planning context built from ONE scan
@@ -13,7 +18,8 @@ import type { DependencyGraphResult, NonConfirmedRelationship } from "./sourceDe
  */
 
 // 2: compact importer-grouped edge format (ADR-020).
-export const PLANNING_CONTEXT_VERSION = 2;
+// 3: requirement focus section (ADR-021).
+export const PLANNING_CONTEXT_VERSION = 3;
 
 // Caps keep the prompt within a local model's practical context window.
 // Truncation is always reported (never silent) — see `truncated`.
@@ -28,7 +34,18 @@ export const PLANNING_CONTEXT_LIMITS = {
   unsupported: 30,
   parseErrors: 20,
   cycles: 10,
+  // Stage 7: files shown per cycle. Only the NUMBER of cycles was capped; a
+  // synthetic 2,000-file graph produced 10 cycles of ~1,400 files each
+  // (404k characters in one section).
+  cycleFiles: 12,
   snippetChars: 120,
+  // Requirement focus (ADR-021).
+  focusFiles: 12,
+  focusNeighbors: 8,
+  focusTests: 4,
+  // 6 covers service -> controller -> route -> route index -> app -> test.
+  focusTestDepth: 6,
+  focusTraversalNodes: 200,
 } as const;
 
 export interface PlanningInventoryItem {
@@ -36,6 +53,40 @@ export interface PlanningInventoryItem {
   type: "file" | "directory";
   status?: string | null | undefined;
   skipReason?: string | null | undefined;
+}
+
+export interface FocusNeighbor {
+  path: string;
+  /** Import statement lines in the importing file (the confirmed edge's evidence). */
+  lines: number[];
+}
+
+export interface FocusTest {
+  path: string;
+  /** Confirmed import hops from the test to the focus file (1 = imports it directly). */
+  depth: number;
+}
+
+export interface FocusFile {
+  path: string;
+  category?: string | undefined;
+  /** Requirement words found in this path. Lexical only — not evidence of relevance. */
+  matchedTerms: string[];
+  importedBy: FocusNeighbor[];
+  importedByTotal: number;
+  imports: FocusNeighbor[];
+  importsTotal: number;
+  tests: FocusTest[];
+  testsTotal: number;
+  /** True when the bounded traversal stopped early — more tests may reach this file. */
+  testsTraversalTruncated: boolean;
+}
+
+export interface RequirementFocus {
+  terms: string[];
+  files: FocusFile[];
+  /** How many source files matched before the `focusFiles` cap. */
+  candidatesTotal: number;
 }
 
 export interface ContextEdge {
@@ -90,6 +141,10 @@ export interface PlanningContext {
   parseErrors: ContextRelationship[];
   cycles: string[][];
   isAcyclic: boolean;
+  /** `null` when no requirement text was given (e.g. re-checking an edited plan). */
+  focus: RequirementFocus | null;
+  /** Stage 5: how much of the tree the scan actually read. */
+  coverage: { stoppedEarly: string[]; unreadDirectories: number; ignoredDirectories: number };
 }
 
 /** Collapses whitespace and caps length — raw import text can be a multi-line source snippet. */
@@ -107,6 +162,63 @@ export function externalPackageName(rawImport: string): string {
   const parts = rawImport.split("/");
   if (rawImport.startsWith("@") && parts.length >= 2) return `${parts[0]}/${parts[1]}`;
   return parts[0] ?? rawImport;
+}
+
+/** Limits that stop the scanner's walk outright (scanner.service.ts `break`s): nothing after them was seen. */
+const WALK_STOPPING_LIMITS = new Set(["maxFiles", "maxDurationMs"]);
+
+const UNREAD_REASON: Record<string, string> = {
+  ignored: "an ignored directory (dependencies/build output)",
+  limit_reached: "a directory not read because a scan limit was reached",
+};
+
+export interface ScanCoverage {
+  /** Walk-stopping limits that were hit, sorted; non-empty = anything unobserved may still exist. */
+  stoppedEarly: string[];
+  /** Path (unread directory, or symlink placeholder) -> why its contents were never observed. */
+  unreadPaths: ReadonlyMap<string, string>;
+}
+
+/**
+ * What the scan could NOT have seen (Stage 5). A path the inventory lacks
+ * is only provably absent when the scan actually looked where it would be.
+ */
+export function scanCoverage(
+  items: readonly (PlanningInventoryItem & { status?: string | null | undefined })[],
+  limitsReached: readonly string[],
+): ScanCoverage {
+  const unreadPaths = new Map<string, string>();
+  for (const item of items) {
+    // A symlink is recorded as a placeholder and never followed: whatever is
+    // at or behind it was not observed.
+    if (item.skipReason === "symlink") {
+      unreadPaths.set(item.relativePath, "a symbolic link the scan does not follow");
+      continue;
+    }
+    if (item.type !== "directory") continue;
+    if (item.status === "error") unreadPaths.set(item.relativePath, "a directory that could not be read");
+    else if (item.status === "skipped") {
+      unreadPaths.set(
+        item.relativePath,
+        UNREAD_REASON[item.skipReason ?? ""] ?? "a directory the scan skipped",
+      );
+    }
+  }
+  return {
+    stoppedEarly: limitsReached.filter((l) => WALK_STOPPING_LIMITS.has(l)).sort(),
+    unreadPaths,
+  };
+}
+
+/** The path itself or its nearest ancestor, if the scan never read it. */
+function unreadAncestor(coverage: ScanCoverage, path: string): [string, string] | undefined {
+  const segments = path.split("/");
+  for (let i = segments.length; i >= 1; i -= 1) {
+    const dir = segments.slice(0, i).join("/");
+    const reason = coverage.unreadPaths.get(dir);
+    if (reason) return [dir, reason];
+  }
+  return undefined;
 }
 
 /**
@@ -140,11 +252,158 @@ function byLocation(a: ContextRelationship, b: ContextRelationship): number {
   );
 }
 
+// Function words and generic verbs only — say nothing about WHERE in a
+// codebase something lives. Domain nouns (user, project, file) stay.
+const FOCUS_STOPWORDS = new Set(
+  (
+    "the and for with from that this when into their them they than then there these those what which while " +
+    "will would should could must can may not all any each every some such only also just more most less very " +
+    "add adds added adding implement implementation support make makes use using used reuse reusing existing " +
+    "new clear ensure allow allows able how often per single want need needs feature code " +
+    "return returns returned expensive operation work way ways time times are was were " +
+    "has have had its approach exist exists"
+  ).split(" "),
+);
+
+/**
+ * A tiny deterministic stemmer — just enough that "limiting"/"limits"
+ * match "limit" and "routes" matches "route". Not linguistic: words ending
+ * in -is/-us/-ss keep their "s" ("analysis", "status", "access").
+ */
+function stem(w: string): string {
+  if (w.length > 5 && w.endsWith("ing")) {
+    const base = w.slice(0, -3);
+    // "running" -> "run", but "rolling" -> "roll" (ll kept).
+    return /([bdgmnprt])\1$/.test(base) ? base.slice(0, -1) : base;
+  }
+  if (w.length > 4 && w.endsWith("ed")) return w.slice(0, -2);
+  if (w.length > 3 && w.endsWith("s") && !/(ss|is|us)$/.test(w)) return w.slice(0, -1);
+  return w;
+}
+
+/** Lowercases, splits camelCase and punctuation, drops stopwords (before and after stemming), stems. */
+export function focusTokens(text: string): string[] {
+  return text
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter((w) => w.length >= 3 && !FOCUS_STOPWORDS.has(w))
+    .map(stem)
+    .filter((w) => w.length >= 3 && !FOCUS_STOPWORDS.has(w));
+}
+
+const EXTENSION_TOKENS = new Set(["ts", "tsx", "js", "jsx", "mts", "cts", "mjs", "cjs"]);
+function pathTokens(p: string): Set<string> {
+  return new Set(focusTokens(p).filter((w) => !EXTENSION_TOKENS.has(w)));
+}
+
+/**
+ * Equal, or one is a prefix of the other with the shorter at least 4
+ * characters — covers what the crude stemmer misses ("cach"/"cache",
+ * "scan"/"scanner", "limit"/"limiter") without language-specific rules.
+ */
+function termMatches(term: string, token: string): boolean {
+  if (term === token) return true;
+  const [shorter, longer] = term.length <= token.length ? [term, token] : [token, term];
+  return shorter.length >= 4 && longer.startsWith(shorter);
+}
+
+// Words every test basename shares; useless for telling tests apart.
+const GENERIC_TEST_TOKENS = new Set(["test", "spec", "integration", "unit", "index"]);
+function basenameTokens(p: string): Set<string> {
+  const base = p.slice(p.lastIndexOf("/") + 1);
+  return new Set([...pathTokens(base)].filter((w) => !GENERIC_TEST_TOKENS.has(w)));
+}
+
+/**
+ * Deterministic requirement focus. Candidate files are chosen LEXICALLY
+ * (a requirement word appears in the path; title words weigh double) —
+ * the prompt says so explicitly. Everything shown about each candidate
+ * (importers, imports, reaching tests) comes from confirmed graph edges
+ * only. Test files are never candidates themselves; they appear under the
+ * files they reach. Bounded by `PLANNING_CONTEXT_LIMITS.focus*`.
+ */
+export function buildRequirementFocus(
+  requirement: { title: string; description?: string | undefined },
+  graph: Pick<DependencyGraphResult, "nodes" | "edges">,
+): RequirementFocus {
+  const L = PLANNING_CONTEXT_LIMITS;
+  const titleTerms = new Set(focusTokens(requirement.title));
+  const allTerms = new Set([...titleTerms, ...focusTokens(requirement.description ?? "")]);
+  const terms = [...allTerms].sort((a, b) => a.localeCompare(b));
+  const categoryOf = new Map(graph.nodes.map((n) => [n.id, n.category]));
+
+  const scored = graph.nodes
+    .filter((n) => n.category !== "test")
+    .map((n) => {
+      const tokens = [...pathTokens(n.id)];
+      const matched = terms.filter((term) => tokens.some((token) => termMatches(term, token)));
+      const score = matched.reduce((s, term) => s + (titleTerms.has(term) ? 2 : 1), 0);
+      return { id: n.id, category: n.category, matched, score };
+    })
+    .filter((c) => c.score > 0)
+    .sort((a, b) => b.score - a.score || a.id.localeCompare(b.id));
+
+  const neighbor = (path: string, lines: number[]): FocusNeighbor => ({ path, lines });
+  const edgeLines = (e: DependencyGraphResult["edges"][number]) =>
+    [...new Set(e.evidence.flatMap((ev) => (ev.line !== undefined ? [ev.line] : [])))].sort((a, b) => a - b);
+
+  const files = scored.slice(0, L.focusFiles).map((c): FocusFile => {
+    const importedBy = graph.edges
+      .filter((e) => e.to === c.id)
+      .map((e) => neighbor(e.from, edgeLines(e)))
+      .sort((a, b) => a.path.localeCompare(b.path));
+    const imports = graph.edges
+      .filter((e) => e.from === c.id)
+      .map((e) => neighbor(e.to, edgeLines(e)))
+      .sort((a, b) => a.path.localeCompare(b.path));
+
+    const reach = getTransitiveDependents(graph, c.id, {
+      maxDepth: L.focusTestDepth,
+      maxNodes: L.focusTraversalNodes,
+    });
+    // Only tests that DO reach this file through confirmed imports are
+    // listed; the ORDER among them is lexical: how many basename words a
+    // test shares with this file or its direct importers (e.g. a limiter
+    // imported by auth.routes.ts ranks auth.integration.test.ts first),
+    // then distance, then path.
+    const rankWords = new Set(
+      [c.id, ...importedBy.map((n) => n.path)].flatMap((x) => [...basenameTokens(x)]),
+    );
+    const tests = reach.dependents
+      .filter((d) => categoryOf.get(d.id) === "test")
+      .map((d) => ({
+        path: d.id,
+        depth: d.depth,
+        shared: [...basenameTokens(d.id)].filter((w) => rankWords.has(w)).length,
+      }))
+      .sort((a, b) => b.shared - a.shared || a.depth - b.depth || a.path.localeCompare(b.path));
+
+    return {
+      path: c.id,
+      category: c.category,
+      matchedTerms: c.matched,
+      importedBy: importedBy.slice(0, L.focusNeighbors),
+      importedByTotal: importedBy.length,
+      imports: imports.slice(0, L.focusNeighbors),
+      importsTotal: imports.length,
+      tests: tests.slice(0, L.focusTests).map(({ path, depth }) => ({ path, depth })),
+      testsTotal: tests.length,
+      testsTraversalTruncated: reach.truncated,
+    };
+  });
+
+  return { terms, files, candidatesTotal: scored.length };
+}
+
 export function buildPlanningContext(input: {
   scanId: string;
   analysisId: string;
   items: readonly PlanningInventoryItem[];
   graph: DependencyGraphResult;
+  requirement?: { title: string; description?: string | undefined } | undefined;
+  /** The scan's `summary.limitsReached` (Stage 5). */
+  limitsReached?: readonly string[] | undefined;
 }): PlanningContext {
   const L = PLANNING_CONTEXT_LIMITS;
   const { graph } = input;
@@ -187,7 +446,8 @@ export function buildPlanningContext(input: {
     allPackages.length > L.externalPackages ||
     unsupported.length > L.unsupported ||
     parseErrors.length > L.parseErrors ||
-    graph.cycles.length > L.cycles;
+    graph.cycles.length > L.cycles ||
+    graph.cycles.slice(0, L.cycles).some((c) => c.length - 1 > L.cycleFiles);
 
   return {
     version: PLANNING_CONTEXT_VERSION,
@@ -213,6 +473,20 @@ export function buildPlanningContext(input: {
     parseErrors: parseErrors.slice(0, L.parseErrors),
     cycles: graph.cycles.slice(0, L.cycles),
     isAcyclic: graph.isAcyclic,
+    coverage: (() => {
+      const cov = scanCoverage(input.items, input.limitsReached ?? []);
+      return {
+        stoppedEarly: cov.stoppedEarly,
+        // Real directories only; symlink placeholders are not "directories not read".
+        unreadDirectories: input.items.filter(
+          (i) => i.type === "directory" && (i.status === "skipped" || i.status === "error"),
+        ).length,
+        ignoredDirectories: input.items.filter(
+          (i) => i.type === "directory" && i.status === "skipped" && i.skipReason === "ignored",
+        ).length,
+      };
+    })(),
+    focus: input.requirement ? buildRequirementFocus(input.requirement, graph) : null,
   };
 }
 
@@ -250,6 +524,67 @@ function renderEdgesByImporter(edges: readonly ContextEdge[]): string[] {
   return lines;
 }
 
+function citeNeighbors(list: FocusNeighbor[], total: number): string {
+  if (total === 0) return "none";
+  const shown = list.map((n) => (n.lines.length ? `${n.path}:${n.lines.join(",")}` : n.path)).join(", ");
+  return total > list.length ? `${shown} (+${total - list.length} more)` : shown;
+}
+
+function renderFocus(focus: RequirementFocus): string[] {
+  const lines = [
+    `REQUIREMENT FOCUS. Files below were picked ONLY because their path contains a word from the requirement (${focus.terms.join(", ") || "no usable words"}) — a lexical match, not proof they are relevant. Their import relationships below ARE confirmed by the analysis. Import relationships show where things are wired; they do not show how an imported symbol is used.`,
+  ];
+  if (focus.files.length === 0) {
+    lines.push("- (no file path matched the requirement's words)");
+    return lines;
+  }
+  if (focus.candidatesTotal > focus.files.length) {
+    lines.push(
+      `(${focus.files.length} of ${focus.candidatesTotal} matching files shown, strongest matches first)`,
+    );
+  }
+  for (const f of focus.files) {
+    const tests =
+      f.testsTotal === 0
+        ? `none found within ${PLANNING_CONTEXT_LIMITS.focusTestDepth} import hops${f.testsTraversalTruncated ? " (search was bounded)" : ""}`
+        : f.tests
+            .map((t) => `${t.path} (${t.depth === 1 ? "imports it directly" : `${t.depth} hops`})`)
+            .join(", ") +
+          (f.testsTotal > f.tests.length ? ` (+${f.testsTotal - f.tests.length} more)` : "") +
+          (f.testsTraversalTruncated ? " (search was bounded)" : "");
+    lines.push(
+      `- ${f.path} [${f.category ?? "uncategorized"}; path matches: ${f.matchedTerms.join(", ")}]`,
+      `  imported by: ${citeNeighbors(f.importedBy, f.importedByTotal)}`,
+      `  imports: ${citeNeighbors(f.imports, f.importsTotal)}`,
+      `  test files reaching it through confirmed imports (closest name match first): ${tests}`,
+    );
+  }
+  return lines;
+}
+
+/** A cycle is stored with its start repeated at the end; long ones are shown as a bounded prefix. */
+function renderCycle(cycle: readonly string[]): string {
+  const files = cycle.length - 1;
+  if (files <= PLANNING_CONTEXT_LIMITS.cycleFiles) return cycle.join(" -> ");
+  const shown = cycle.slice(0, PLANNING_CONTEXT_LIMITS.cycleFiles);
+  return `${shown.join(" -> ")} -> … (${files - shown.length} more files, then back to ${cycle[0]})`;
+}
+
+function renderCoverage(c: PlanningContext["coverage"]): string {
+  const gaps = c.unreadDirectories - c.ignoredDirectories;
+  const ignored = c.ignoredDirectories
+    ? ` ${c.ignoredDirectories} ignored director${c.ignoredDirectories === 1 ? "y" : "ies"} (dependencies/build output) were not read.`
+    : "";
+  if (c.stoppedEarly.length === 0 && gaps === 0) {
+    return `Scan coverage: complete.${ignored}`;
+  }
+  const parts = [
+    ...(c.stoppedEarly.length ? [`the scan stopped early (${c.stoppedEarly.join(", ")})`] : []),
+    `${c.unreadDirectories} directories were not read`,
+  ];
+  return `Scan coverage: INCOMPLETE — ${parts.join("; ")}. A file missing from this context may still exist; do not assume it is absent.`;
+}
+
 /** Deterministic prompt section. Every list states whether it was truncated. */
 export function renderPlanningContext(ctx: PlanningContext): string {
   const lines: string[] = [];
@@ -257,6 +592,9 @@ export function renderPlanningContext(ctx: PlanningContext): string {
     `VERIFIED PROJECT CONTEXT (read-only scan ${ctx.scanId}, dependency analysis ${ctx.analysisId}).`,
     "This is the ONLY evidence you have about the codebase. Do not assume any file, dependency, or package that is not listed here.",
     "",
+    renderCoverage(ctx.coverage),
+    "",
+    ...(ctx.focus ? [...renderFocus(ctx.focus), ""] : []),
     `Files in the scan inventory (${shownOf(ctx.files.length, ctx.counts.files)}):`,
     ...(ctx.files.length ? ctx.files.map((f) => `- ${f}`) : ["- (none)"]),
     "",
@@ -288,7 +626,7 @@ export function renderPlanningContext(ctx: PlanningContext): string {
     ctx.isAcyclic
       ? "Import cycles: none found among the confirmed dependencies."
       : `Import cycles among confirmed dependencies (${shownOf(ctx.cycles.length, ctx.counts.cycles)}):`,
-    ...(ctx.isAcyclic ? [] : ctx.cycles.map((c) => `- ${c.join(" -> ")}`)),
+    ...(ctx.isAcyclic ? [] : ctx.cycles.map((c) => `- ${renderCycle(c)}`)),
   );
   if (ctx.truncated) {
     lines.push("", "Some lists above were truncated to keep this context bounded; the totals are exact.");
@@ -298,10 +636,19 @@ export function renderPlanningContext(ctx: PlanningContext): string {
 
 export type AffectedFileEvidence = "in_scan" | "not_in_scan" | "unverified";
 
+export type AffectedFileChangeClaim = "modify" | "create" | "test" | "reference";
+
 export interface ClassifiedAffectedFile {
   path: string;
   reason: string;
+  /** Absent when the AI stated no intent — never defaulted. */
+  change?: AffectedFileChangeClaim | undefined;
   evidence: AffectedFileEvidence;
+  conflict?: string | undefined;
+  /** Stage 4: verified relation to the plan's impact target (absent = not found within the bounded impact). */
+  impactRelation?: ImpactRelation | undefined;
+  /** Stage 5: why a label is "unverified" even though the plan is grounded (e.g. inside an unread directory). */
+  evidenceNote?: string | undefined;
   dependentsCount?: number | undefined;
   dependenciesCount?: number | undefined;
 }
@@ -309,6 +656,10 @@ export interface ClassifiedAffectedFile {
 export interface AffectedFileEvidenceSource {
   inventory: ReadonlySet<string>;
   graph: Pick<DependencyGraphResult, "nodes" | "edges">;
+  /** Stage 4: verified relation to the plan's impact target, if one was requested. */
+  impactRelation?: ((path: string) => ImpactRelation | undefined) | undefined;
+  /** Stage 5: what the scan could not have seen. Absent = treat the scan as complete (pre-Stage 5 behaviour). */
+  coverage?: ScanCoverage | undefined;
 }
 
 /**
@@ -318,7 +669,11 @@ export interface AffectedFileEvidenceSource {
  * paths keep their first occurrence.
  */
 export function classifyAffectedFiles(
-  files: readonly { path: string; reason?: string | undefined }[],
+  files: readonly {
+    path: string;
+    reason?: string | undefined;
+    change?: AffectedFileChangeClaim | undefined;
+  }[],
   source: AffectedFileEvidenceSource | null,
 ): ClassifiedAffectedFile[] {
   const seen = new Set<string>();
@@ -329,20 +684,69 @@ export function classifyAffectedFiles(
     if (seen.has(file.path)) continue;
     seen.add(file.path);
     const reason = file.reason ?? "";
+    const change = file.change;
+    // Only present when the AI actually stated an intent.
+    const claim = change ? { change } : {};
 
     if (!source) {
-      result.push({ path: file.path, reason, evidence: "unverified" });
+      result.push({ path: file.path, reason, ...claim, evidence: "unverified" });
+      continue;
+    }
+    // Absent from the inventory only proves absence where the scan looked.
+    const unread =
+      !source.inventory.has(file.path) && source.coverage
+        ? unreadAncestor(source.coverage, file.path)
+        : undefined;
+    if (unread) {
+      result.push({
+        path: file.path,
+        reason,
+        ...claim,
+        evidence: "unverified",
+        evidenceNote:
+          unread[0] === file.path
+            ? `This path is ${unread[1]}; its contents were not observed.`
+            : `Inside ${unread[0]}, ${unread[1]}; the scan did not look inside it.`,
+      });
+      continue;
+    }
+    if (!source.inventory.has(file.path) && source.coverage?.stoppedEarly.length) {
+      result.push({
+        path: file.path,
+        reason,
+        ...claim,
+        evidence: "unverified",
+        evidenceNote: `The scan stopped early (${source.coverage.stoppedEarly.join(", ")}), so this path may exist but was not observed.`,
+      });
       continue;
     }
     if (!source.inventory.has(file.path)) {
-      result.push({ path: file.path, reason, evidence: "not_in_scan" });
+      result.push({
+        path: file.path,
+        reason,
+        ...claim,
+        evidence: "not_in_scan",
+        // Only "create" (and a new test file) make sense for a path the
+        // scan never saw; modifying or following a file that isn't there is
+        // a contradiction the reviewer must see.
+        conflict:
+          change === "modify" || change === "reference"
+            ? `Claimed "${change}", but this path is not in the scan`
+            : undefined,
+      });
       continue;
     }
     const isNode = nodeIds?.has(file.path) ?? false;
+    // Only in-scan files can have a verified relation to the impact target.
+    const relation = source.impactRelation?.(file.path);
     result.push({
       path: file.path,
       reason,
+      ...claim,
       evidence: "in_scan",
+      conflict:
+        change === "create" ? 'Claimed "create", but this file already exists in the scan' : undefined,
+      ...(relation ? { impactRelation: relation } : {}),
       dependentsCount: isNode ? source.graph.edges.filter((e) => e.to === file.path).length : undefined,
       dependenciesCount: isNode ? source.graph.edges.filter((e) => e.from === file.path).length : undefined,
     });

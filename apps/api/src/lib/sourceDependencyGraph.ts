@@ -45,6 +45,7 @@ export interface GraphRelationshipInput {
   importType?: ImportType | undefined;
   line?: number | undefined;
   column?: number | undefined;
+  typeOnly?: boolean | undefined;
   status: RelationshipStatus;
   resolvedRelativePath?: string | undefined;
   resolutionMethod?: string | undefined;
@@ -65,6 +66,8 @@ export interface GraphEdgeEvidence {
   line?: number | undefined;
   column?: number | undefined;
   resolutionMethod?: string | undefined;
+  /** Stage 5: the statement is erased at runtime (compile-time dependency only). */
+  typeOnly?: boolean | undefined;
 }
 
 export interface GraphEdge {
@@ -232,6 +235,7 @@ export function buildDependencyGraph(
       line: rel.line,
       column: rel.column,
       resolutionMethod: rel.resolutionMethod,
+      ...(rel.typeOnly ? { typeOnly: true } : {}),
     };
     const existing = edgesByKey.get(key);
     if (existing) {
@@ -290,6 +294,59 @@ export function getDirectDependencies(result: DependencyGraphResult, nodeId: str
 /** Files that import `nodeId` (incoming edges), sorted. */
 export function getDirectDependents(result: DependencyGraphResult, nodeId: string): string[] {
   return coreGetDependents(toCoreGraph(result), nodeId);
+}
+
+export interface TransitiveDependent {
+  id: string;
+  /** Import hops from the start node: 1 = imports it directly. */
+  depth: number;
+  /** The file this dependent imports on its shortest path back to the start node. */
+  via: string;
+}
+
+/**
+ * Files that import `nodeId` directly or through a chain of CONFIRMED
+ * edges (breadth-first over incoming edges), i.e. what could be affected
+ * by a change to it. Bounded by `maxDepth` hops and `maxNodes` results.
+ * `truncated` is set when either bound cut anything off, so a caller can
+ * never mistake a bounded answer for a complete one. Cycle-safe (each file
+ * is visited once; the start node is never its own dependent) and
+ * deterministic (level by level, ids sorted within a level; the first
+ * `via` in that order wins). Unresolved/external/unsupported imports are
+ * never edges here, so they never contribute.
+ */
+export function getTransitiveDependents(
+  result: Pick<DependencyGraphResult, "edges">,
+  nodeId: string,
+  bounds: { maxDepth: number; maxNodes: number },
+): { dependents: TransitiveDependent[]; truncated: boolean } {
+  const importersOf = new Map<string, string[]>();
+  for (const e of result.edges) {
+    const list = importersOf.get(e.to) ?? [];
+    list.push(e.from);
+    importersOf.set(e.to, list);
+  }
+
+  const visited = new Set<string>([nodeId]);
+  const dependents: TransitiveDependent[] = [];
+  let frontier = [nodeId];
+  for (let depth = 1; frontier.length > 0; depth += 1) {
+    const next = new Map<string, string>();
+    for (const current of [...frontier].sort((a, b) => a.localeCompare(b))) {
+      for (const importer of importersOf.get(current) ?? []) {
+        if (!visited.has(importer) && !next.has(importer)) next.set(importer, current);
+      }
+    }
+    if (next.size === 0) break;
+    if (depth > bounds.maxDepth) return { dependents, truncated: true };
+    for (const id of [...next.keys()].sort((a, b) => a.localeCompare(b))) {
+      if (dependents.length >= bounds.maxNodes) return { dependents, truncated: true };
+      visited.add(id);
+      dependents.push({ id, depth, via: next.get(id) as string });
+    }
+    frontier = [...next.keys()];
+  }
+  return { dependents, truncated: false };
 }
 
 /** Nodes nothing else imports — typical entry points. Sorted. */

@@ -1,5 +1,7 @@
 import { Schema, model, type HydratedDocument, type InferSchemaType } from "mongoose";
 import { PRIORITIES } from "./Requirement.js";
+import { AFFECTED_FILE_CHANGES } from "../validators/aiPlan.validators.js";
+import { IMPACT_RELATIONS } from "../lib/impactAnalysis.js";
 
 // Generation + structural/graph validation happen synchronously, in the
 // same request, before anything is persisted (see plan.service.ts) — an
@@ -15,14 +17,28 @@ export type PlanStatus = (typeof PLAN_STATUSES)[number];
 // taken from the AI. "unverified" = the plan was not grounded in a scan.
 export const AFFECTED_FILE_EVIDENCE = ["in_scan", "not_in_scan", "unverified"] as const;
 
-const affectedFileSchema = new Schema(
+// Exported for Task.planEvidence (C5.1): an approved task carries a verbatim
+// copy of these, so the shape must stay identical.
+export const affectedFileSchema = new Schema(
   {
     path: { type: String, required: true, trim: true, maxlength: 300 },
+    // AI/human-supplied (claims):
     reason: { type: String, trim: true, maxlength: 500, default: "" },
+    // No default: absent means the AI stated no intent (and C5-era plans
+    // loaded from the database must not appear to claim one).
+    change: { type: String, enum: AFFECTED_FILE_CHANGES },
+    // Server-computed (evidence) — never taken from input:
     evidence: { type: String, enum: AFFECTED_FILE_EVIDENCE, required: true },
     // Confirmed-graph counts at generation time; only for in-scan source files.
     dependentsCount: { type: Number },
     dependenciesCount: { type: Number },
+    // Set when the claimed `change` contradicts the scan (C5.1).
+    conflict: { type: String, maxlength: 300 },
+    // Stage 4: verified relation to the plan's impact target, from the
+    // bounded impact. Absent = not found within it (NOT "unrelated").
+    impactRelation: { type: String, enum: IMPACT_RELATIONS },
+    // Stage 5: why a grounded plan still can't verify this path.
+    evidenceNote: { type: String, maxlength: 300 },
   },
   { _id: false },
 );
@@ -37,6 +53,39 @@ const sourceContextSchema = new Schema(
     scanCreatedAt: { type: Date },
     analysisCreatedAt: { type: Date },
     contextVersion: { type: Number, required: true },
+    // C5.1: what the lexical requirement focus pointed the model at, so a
+    // reviewer can see why those files were in front of it.
+    // Stage 5: how much of the tree the scan read. Absent on older plans.
+    coverage: {
+      type: new Schema(
+        {
+          stoppedEarly: { type: [String], default: [] },
+          unreadDirectories: { type: Number, required: true },
+          ignoredDirectories: { type: Number, required: true },
+        },
+        { _id: false },
+      ),
+      default: undefined,
+    },
+    focusTerms: { type: [String], default: [] },
+    focusFiles: { type: [String], default: [] },
+    // Stage 4: the optional impact target and what the model was shown.
+    impact: {
+      type: new Schema(
+        {
+          file: { type: String, required: true },
+          inGraph: { type: Boolean, required: true },
+          maxDepth: { type: Number, required: true },
+          maxNodes: { type: Number, required: true },
+          directDependencies: { type: Number, required: true },
+          directDependents: { type: Number, required: true },
+          transitiveDependentsShown: { type: Number, required: true },
+          truncated: { type: Boolean, required: true },
+        },
+        { _id: false },
+      ),
+      default: null,
+    },
     truncated: { type: Boolean, required: true },
     counts: {
       files: { type: Number, required: true },
@@ -62,6 +111,7 @@ const suggestedTaskSchema = new Schema(
     priority: { type: String, enum: PRIORITIES, default: "medium" },
     dependsOn: { type: [String], default: [] },
     rationale: { type: String, trim: true, maxlength: 1000, default: "" },
+    testingApproach: { type: String, trim: true, maxlength: 1000, default: "" },
     affectedFiles: { type: [affectedFileSchema], default: [] },
   },
   { _id: false },

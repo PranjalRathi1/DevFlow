@@ -7,6 +7,7 @@ import { projectService } from "../../../services/projectService";
 import { requirementService } from "../../../services/requirementService";
 import { planService } from "../../../services/planService";
 import { scanService } from "../../../services/scanService";
+import { graphService } from "../../../services/graphService";
 import type { Project } from "../../../types/project";
 import type { Requirement } from "../../../types/requirement";
 import type { Plan } from "../../../types/plan";
@@ -16,6 +17,7 @@ vi.mock("../../../services/projectService");
 vi.mock("../../../services/requirementService");
 vi.mock("../../../services/planService");
 vi.mock("../../../services/scanService");
+vi.mock("../../../services/graphService");
 
 const project: Project = {
   _id: "proj-1",
@@ -76,8 +78,19 @@ const latestScan = {
   createdAt: new Date().toISOString(),
 } as unknown as Scan;
 
-function renderTab(scan: Scan | null = null) {
+// Only the fields the Plans tab reads from the graph.
+const graphWith = (ids: string[]) =>
+  ({ graph: { nodes: ids.map((id) => ({ id })) } }) as unknown as Awaited<
+    ReturnType<typeof graphService.getGraph>
+  >;
+
+function renderTab(scan: Scan | null = null, graphIds: string[] | null = null) {
   vi.mocked(scanService.getLatestScan).mockResolvedValue({ scan });
+  if (graphIds) vi.mocked(graphService.getGraph).mockResolvedValue(graphWith(graphIds));
+  else
+    vi.mocked(graphService.getGraph).mockRejectedValue(
+      new Error("No analysis has been run for this scan yet"),
+    );
   vi.mocked(projectService.get).mockResolvedValue({ project });
   vi.mocked(requirementService.list).mockResolvedValue({ requirements: [requirement] });
   return renderProjectTab(<ProjectPlansTab />, project._id);
@@ -177,11 +190,15 @@ describe("ProjectPlansTab", () => {
     expect(checkbox).toBeChecked();
     await user.selectOptions(screen.getByLabelText(/requirement/i), "req-1");
     await user.click(screen.getByRole("button", { name: /generate plan/i }));
-    await waitFor(() => expect(planService.generate).toHaveBeenCalledWith("proj-1", "req-1", "scan-1"));
+    await waitFor(() =>
+      expect(planService.generate).toHaveBeenCalledWith("proj-1", "req-1", "scan-1", undefined),
+    );
 
     await user.click(checkbox);
     await user.click(screen.getByRole("button", { name: /generate plan/i }));
-    await waitFor(() => expect(planService.generate).toHaveBeenLastCalledWith("proj-1", "req-1", undefined));
+    await waitFor(() =>
+      expect(planService.generate).toHaveBeenLastCalledWith("proj-1", "req-1", undefined, undefined),
+    );
   });
 
   it("explains that a plan will be ungrounded when there is no usable scan", async () => {
@@ -259,5 +276,245 @@ describe("ProjectPlansTab", () => {
     await user.click(await screen.findByText("Authentication Plan"));
     const dialog = within(await screen.findByRole("dialog"));
     expect(dialog.getByText(/not grounded in a scan/i)).toBeInTheDocument();
+  });
+
+  it("separates the AI's claims from DevFlow's checks in the review dialog", async () => {
+    const plan: Plan = {
+      ...samplePlan,
+      sourceContext: {
+        scan: "scan-1",
+        analysis: "an-1",
+        contextVersion: 3,
+        truncated: false,
+        counts: {
+          files: 5,
+          graphNodes: 4,
+          confirmedEdges: 3,
+          unresolved: 0,
+          external: 1,
+          externalPackages: 1,
+          unsupported: 0,
+          parseErrors: 0,
+          cycles: 0,
+        },
+        focusTerms: ["limit", "rate"],
+        focusFiles: ["src/middleware/rateLimit.middleware.ts"],
+      },
+      suggestedTasks: [
+        {
+          ...samplePlan.suggestedTasks[0]!,
+          testingApproach: "Integration test in auth.integration.test.ts",
+          affectedFiles: [
+            {
+              path: "src/middleware/rateLimit.middleware.ts",
+              reason: "existing limiter",
+              change: "reference",
+              evidence: "in_scan",
+              dependentsCount: 1,
+              dependenciesCount: 1,
+            },
+            {
+              path: "src/util.ts",
+              reason: "",
+              change: "create",
+              evidence: "in_scan",
+              conflict: 'Claimed "create", but this file already exists in the scan',
+            },
+          ],
+        },
+      ],
+    };
+    vi.mocked(planService.aiStatus).mockResolvedValue({ available: true, provider: "ollama", model: "m" });
+    vi.mocked(planService.list).mockResolvedValue({ plans: [plan] });
+    const user = userEvent.setup();
+    renderTab(latestScan);
+
+    await user.click(await screen.findByText("Authentication Plan"));
+    const dialog = within(await screen.findByRole("dialog"));
+    expect(dialog.getByText(/matched by file name only, not proof of relevance/i)).toHaveTextContent(
+      "src/middleware/rateLimit.middleware.ts",
+    );
+    expect(dialog.getByText(/file labels are checked by devflow/i)).toBeInTheDocument();
+    expect(dialog.getByText(/integration test in auth\.integration\.test\.ts/i)).toBeInTheDocument();
+    // The testing approach is AI-authored and labelled as such.
+    expect(dialog.getByText(/AI testing approach:/)).toBeInTheDocument();
+    const files = within(dialog.getByRole("list", { name: /affected files for design schema/i }));
+    const [reference, conflicting] = files.getAllByRole("listitem");
+    expect(reference).toHaveTextContent("AI intent: follow its pattern (no change)");
+    expect(reference).toHaveTextContent("In scan");
+    expect(conflicting).toHaveTextContent('Claimed "create", but this file already exists in the scan');
+  });
+
+  it("states the review outcome for an approved plan and offers no review actions", async () => {
+    vi.mocked(planService.aiStatus).mockResolvedValue({ available: true, provider: "ollama", model: "m" });
+    vi.mocked(planService.list).mockResolvedValue({
+      plans: [{ ...samplePlan, status: "approved", reviewedAt: new Date().toISOString() }],
+    });
+    const user = userEvent.setup();
+    renderTab();
+
+    await user.click(await screen.findByText("Authentication Plan"));
+    const dialog = within(await screen.findByRole("dialog"));
+    expect(
+      dialog.getByText(/approved — its tasks were created with a copy of this evidence/i),
+    ).toBeInTheDocument();
+    expect(dialog.queryByRole("button", { name: /approve/i })).not.toBeInTheDocument();
+    expect(dialog.queryByRole("button", { name: /^reject$/i })).not.toBeInTheDocument();
+  });
+
+  it("offers the scan's analysed files as an optional impact target and sends the choice", async () => {
+    vi.mocked(planService.aiStatus).mockResolvedValue({ available: true, provider: "ollama", model: "m" });
+    vi.mocked(planService.list).mockResolvedValue({ plans: [] });
+    vi.mocked(planService.generate).mockResolvedValue({ plan: samplePlan });
+    const user = userEvent.setup();
+    renderTab(latestScan, ["src/a.ts", "src/routes/scan.routes.ts"]);
+
+    const target = await screen.findByLabelText(/file you plan to change/i);
+    await user.selectOptions(screen.getByLabelText(/^requirement$/i), "req-1");
+    await user.selectOptions(target, "src/routes/scan.routes.ts");
+    await user.click(screen.getByRole("button", { name: /generate plan/i }));
+    await waitFor(() =>
+      expect(planService.generate).toHaveBeenCalledWith(
+        "proj-1",
+        "req-1",
+        "scan-1",
+        "src/routes/scan.routes.ts",
+      ),
+    );
+  });
+
+  it("hides the impact target picker when the scan has no analysis", async () => {
+    vi.mocked(planService.aiStatus).mockResolvedValue({ available: true, provider: "ollama", model: "m" });
+    vi.mocked(planService.list).mockResolvedValue({ plans: [] });
+    renderTab(latestScan, null);
+    await screen.findByRole("checkbox", { name: /ground the plan in the latest scan/i });
+    expect(screen.queryByLabelText(/file you plan to change/i)).not.toBeInTheDocument();
+  });
+
+  describe("review evidence (Stage 8)", () => {
+    const baseContext = {
+      scan: "scan-1",
+      analysis: "an-1",
+      contextVersion: 3,
+      truncated: false,
+      counts: {
+        files: 5,
+        graphNodes: 4,
+        confirmedEdges: 3,
+        unresolved: 0,
+        external: 0,
+        externalPackages: 0,
+        unsupported: 0,
+        parseErrors: 0,
+        cycles: 0,
+      },
+    };
+    const planWith = (
+      sourceContext: NonNullable<Plan["sourceContext"]>,
+      affectedFiles: NonNullable<Plan["suggestedTasks"][number]["affectedFiles"]>,
+    ): Plan => ({
+      ...samplePlan,
+      sourceContext,
+      suggestedTasks: [{ ...samplePlan.suggestedTasks[0]!, affectedFiles }],
+    });
+    async function openReview(plan: Plan, scan: Scan | null = latestScan) {
+      vi.mocked(planService.aiStatus).mockResolvedValue({ available: true, provider: "ollama", model: "m" });
+      vi.mocked(planService.list).mockResolvedValue({ plans: [plan] });
+      const user = userEvent.setup();
+      renderTab(scan);
+      await user.click(await screen.findByText("Authentication Plan"));
+      return within(await screen.findByRole("dialog"));
+    }
+
+    it("warns when the plan's evidence comes from an older scan than the latest", async () => {
+      const dialog = await openReview(planWith({ ...baseContext, scan: "scan-OLD" }, []), latestScan);
+      expect(await dialog.findByText(/a newer scan of this project exists/i)).toBeInTheDocument();
+    });
+
+    it("does not warn when the plan is grounded in the latest scan", async () => {
+      const dialog = await openReview(planWith(baseContext, []), latestScan);
+      await dialog.findByText(/grounded in scan/i);
+      expect(dialog.queryByText(/a newer scan of this project exists/i)).not.toBeInTheDocument();
+    });
+
+    it("says an incomplete scan leaves unread files unverified, and shows why for each", async () => {
+      const dialog = await openReview(
+        planWith(
+          {
+            ...baseContext,
+            coverage: { stoppedEarly: ["maxFiles"], unreadDirectories: 2, ignoredDirectories: 1 },
+          },
+          [
+            {
+              path: "node_modules/x/index.js",
+              reason: "",
+              evidence: "unverified",
+              evidenceNote:
+                "Inside node_modules, an ignored directory (dependencies/build output); the scan did not look inside it.",
+            },
+          ],
+        ),
+      );
+      expect(dialog.getByText(/the scan was incomplete \(stopped early: maxFiles\)/i)).toBeInTheDocument();
+      const list = within(dialog.getByRole("list", { name: /affected files for design schema/i }));
+      expect(list.getByText("Unverified")).toBeInTheDocument();
+      expect(list.getByText(/why unverified: inside node_modules/i)).toBeInTheDocument();
+    });
+
+    it("words impact relations as possibilities and flags an unreferenced target", async () => {
+      const dialog = await openReview(
+        planWith(
+          {
+            ...baseContext,
+            impact: {
+              file: "src/routes/scan.routes.ts",
+              inGraph: true,
+              maxDepth: 6,
+              maxNodes: 30,
+              directDependencies: 8,
+              directDependents: 1,
+              transitiveDependentsShown: 16,
+              truncated: true,
+            },
+          },
+          [
+            {
+              path: "src/controllers/scan.controller.ts",
+              reason: "",
+              change: "modify",
+              evidence: "in_scan",
+              impactRelation: "dependency",
+            },
+            {
+              path: "src/routes/index.ts",
+              reason: "wire it",
+              evidence: "in_scan",
+              impactRelation: "direct_dependent",
+            },
+          ],
+        ),
+      );
+      const summary = dialog.getByText(/planned change target/i);
+      expect(summary).toHaveTextContent("src/routes/scan.routes.ts");
+      expect(summary).toHaveTextContent(/more files may be affected/);
+      expect(summary).toHaveTextContent(/do not all need to change/);
+      expect(summary).toHaveTextContent(/no task in this plan references the target file/i);
+      const list = within(dialog.getByRole("list", { name: /affected files for design schema/i }));
+      expect(
+        list.getByText(/imported by the target \(changing the target does not affect it\)/),
+      ).toBeInTheDocument();
+      expect(list.getByText(/imports the target directly \(may be affected\)/)).toBeInTheDocument();
+      // AI prose is labelled as the AI's own words.
+      expect(list.getByText(/AI's reason: wire it/)).toBeInTheDocument();
+      expect(dialog.queryByText(/must change/i)).not.toBeInTheDocument();
+    });
+
+    it("explains every label, including that unverified is not absent", async () => {
+      const dialog = await openReview(planWith(baseContext, []));
+      const legend = dialog.getByText(/file labels are checked by devflow/i);
+      expect(legend).toHaveTextContent(/the scan looked there and did not find it/);
+      expect(legend).toHaveTextContent(/devflow could not check/i);
+      expect(legend).toHaveTextContent(/not how code runs/);
+    });
   });
 });

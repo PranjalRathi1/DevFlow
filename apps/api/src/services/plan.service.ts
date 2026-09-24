@@ -18,6 +18,14 @@ import {
   renderPlanningContext,
   type AffectedFileEvidenceSource,
 } from "../lib/planningContext.js";
+import { assertObservedFile } from "./impact.service.js";
+import {
+  computeImpact,
+  impactRelationOf,
+  renderImpactForPrompt,
+  IMPACT_PLANNING_BOUNDS,
+  type ImpactResult,
+} from "../lib/impactAnalysis.js";
 import { env } from "../config/env.js";
 import { logger } from "../utils/logger.js";
 
@@ -39,7 +47,23 @@ function withFileEvidence(tasks: SuggestedTask[], source: AffectedFileEvidenceSo
   return tasks.map((task) => ({ ...task, affectedFiles: classifyAffectedFiles(task.affectedFiles, source) }));
 }
 
-function sourceContextFor(grounding: PlanGrounding) {
+/** Adds the verified impact relation lookup to a grounding's evidence source (Stage 4). */
+function evidenceSourceFor(
+  grounding: PlanGrounding,
+  impact: ImpactResult | null,
+): AffectedFileEvidenceSource {
+  return impact
+    ? { ...grounding.evidenceSource, impactRelation: (path: string) => impactRelationOf(impact, path) }
+    : grounding.evidenceSource;
+}
+
+/** Same pinned graph + same stored bounds => the same impact as at generation (deterministic). */
+function impactFor(grounding: PlanGrounding, file: string, bounds: { maxDepth: number; maxNodes: number }) {
+  assertObservedFile(grounding.scan, file);
+  return computeImpact(grounding.graph, file, bounds);
+}
+
+function sourceContextFor(grounding: PlanGrounding, impact: ImpactResult | null) {
   return {
     scan: grounding.scan._id,
     analysis: grounding.analysis._id,
@@ -48,6 +72,21 @@ function sourceContextFor(grounding: PlanGrounding) {
     contextVersion: grounding.context.version,
     truncated: grounding.context.truncated,
     counts: grounding.context.counts,
+    coverage: grounding.context.coverage,
+    focusTerms: grounding.context.focus?.terms ?? [],
+    focusFiles: grounding.context.focus?.files.map((f) => f.path) ?? [],
+    impact: impact
+      ? {
+          file: impact.file,
+          inGraph: impact.inGraph,
+          maxDepth: impact.bounds.maxDepth,
+          maxNodes: impact.bounds.maxNodes,
+          directDependencies: impact.totals.directDependencies,
+          directDependents: impact.totals.directDependents,
+          transitiveDependentsShown: impact.transitiveDependents.length,
+          truncated: impact.truncated,
+        }
+      : null,
   };
 }
 
@@ -62,18 +101,35 @@ export async function generatePlan(
   projectId: string,
   requirementId: string,
   scanId?: string,
+  impactFile?: string,
 ): Promise<PlanDocument> {
   const project = await getProjectForOwner(ownerId, projectId);
   const requirement = await getOwnedRequirementInProject(ownerId, projectId, requirementId);
   // Batch C5: resolved BEFORE calling the AI, so a bad/foreign/unanalyzed
   // scan fails fast and never costs a model call.
-  const grounding = scanId ? await loadPlanGrounding(ownerId, projectId, scanId) : null;
+  const grounding = scanId
+    ? await loadPlanGrounding(ownerId, projectId, scanId, undefined, {
+        title: requirement.title,
+        description: requirement.description,
+      })
+    : null;
+
+  if (impactFile && !grounding) {
+    throw new AppError("impactFile requires scanId", 400);
+  }
+  const impact = grounding && impactFile ? impactFor(grounding, impactFile, IMPACT_PLANNING_BOUNDS) : null;
+  let projectEvidence: string | undefined;
+  if (grounding) {
+    const categories = new Map(grounding.graph.nodes.map((n) => [n.id, n.category]));
+    projectEvidence = renderPlanningContext(grounding.context);
+    if (impact) projectEvidence += `\n\n${renderImpactForPrompt(impact, (f) => categories.get(f))}`;
+  }
 
   const prompt = buildPlanningPrompt({
     projectName: project.name,
     requirementTitle: requirement.title,
     requirementDescription: requirement.description,
-    projectEvidence: grounding ? renderPlanningContext(grounding.context) : undefined,
+    projectEvidence,
   });
 
   const provider = getAIProvider();
@@ -136,9 +192,12 @@ export async function generatePlan(
     summary: plan.summary,
     assumptions: plan.assumptions,
     risks: plan.risks,
-    suggestedTasks: withFileEvidence(plan.suggestedTasks, grounding?.evidenceSource ?? null),
+    suggestedTasks: withFileEvidence(
+      plan.suggestedTasks,
+      grounding ? evidenceSourceFor(grounding, impact) : null,
+    ),
     suggestedOrder: validation.suggestedOrder,
-    sourceContext: grounding ? sourceContextFor(grounding) : null,
+    sourceContext: grounding ? sourceContextFor(grounding, impact) : null,
     validation: { valid: true, errors: [] },
     aiMeta: {
       provider: env.AI_PROVIDER,
@@ -201,31 +260,108 @@ export async function updatePlanForOwner(
         plan.sourceContext.scan.toString(),
         plan.sourceContext.analysis.toString(),
       );
-      source = grounding.evidenceSource;
+      const pinned = plan.sourceContext.impact;
+      const impact = pinned
+        ? impactFor(grounding, pinned.file, { maxDepth: pinned.maxDepth, maxNodes: pinned.maxNodes })
+        : null;
+      source = evidenceSourceFor(grounding, impact);
     }
     updates.suggestedTasks = withFileEvidence(input.suggestedTasks, source);
     updates.suggestedOrder = suggestedOrder;
   }
 
-  const updated = await Plan.findOneAndUpdate({ _id: planId, owner: ownerId }, updates, {
-    new: true,
-    runValidators: true,
-  });
+  // Conditional on status, so an edit can never land after a concurrent
+  // approval/rejection claimed the plan (the check above is only a fast path).
+  const updated = await Plan.findOneAndUpdate(
+    { _id: planId, owner: ownerId, status: "needs_review" },
+    updates,
+    { new: true, runValidators: true },
+  );
   if (!updated) {
-    throw new AppError("Plan not found", 404);
+    throw await reviewConflictError(
+      ownerId,
+      planId,
+      "This plan has already been reviewed and can no longer be edited",
+    );
   }
   return updated;
 }
 
+/** After a conditional update matched nothing: was the plan gone, or already reviewed? */
+async function reviewConflictError(ownerId: string, planId: string, message: string): Promise<AppError> {
+  const exists = await Plan.exists({ _id: planId, owner: ownerId });
+  return exists ? new AppError(message, 409) : new AppError("Plan not found", 404);
+}
+
+/**
+ * Atomically moves a plan out of "needs_review". Exactly one concurrent
+ * caller can win: the filter only matches while the status is still
+ * "needs_review" (Stage 1 — a read-then-save let three simultaneous
+ * approvals all succeed).
+ */
+async function claimForReview(
+  ownerId: string,
+  planId: string,
+  status: "approved" | "rejected",
+): Promise<PlanDocument> {
+  requireValidObjectId(planId, "plan id");
+  const filter: Record<string, unknown> = { _id: planId, owner: ownerId, status: "needs_review" };
+  // Last line of defence: an invalid plan is never approvable (they are
+  // never persisted, so this should be unreachable).
+  if (status === "approved") filter["validation.valid"] = true;
+  const claimed = await Plan.findOneAndUpdate(
+    filter,
+    { $set: { status, reviewedAt: new Date() } },
+    { new: true },
+  );
+  if (claimed) return claimed;
+
+  const current = await Plan.findOne({ _id: planId, owner: ownerId });
+  if (!current) throw new AppError("Plan not found", 404);
+  if (current.status !== "needs_review") throw new AppError("This plan has already been reviewed", 409);
+  throw new AppError("This plan did not pass validation and cannot be approved", 422);
+}
+
 export async function rejectPlanForOwner(ownerId: string, planId: string): Promise<PlanDocument> {
-  const plan = await getPlanForOwner(ownerId, planId);
-  if (plan.status !== "needs_review") {
-    throw new AppError("This plan has already been reviewed", 409);
-  }
-  plan.status = "rejected";
-  plan.reviewedAt = new Date();
-  await plan.save();
-  return plan;
+  // Only the status and review time change; the plan's evidence stays as reviewed.
+  return claimForReview(ownerId, planId, "rejected");
+}
+
+type PlanTask = PlanDocument["suggestedTasks"][number];
+
+/**
+ * A detached, plain copy of one plan task's evidence for its Task. Built
+ * field by field from the plan as reviewed — never re-derived — so the
+ * task can't share references with the plan document, and a field
+ * that was absent (e.g. no `change` claimed) stays absent.
+ */
+function snapshotTaskEvidence(plan: PlanDocument, task: PlanTask) {
+  const sc = plan.sourceContext;
+  return {
+    plan: plan._id,
+    tempId: task.tempId,
+    rationale: task.rationale ?? "",
+    testingApproach: task.testingApproach ?? "",
+    affectedFiles: task.affectedFiles.map((f) => ({
+      path: f.path,
+      reason: f.reason,
+      evidence: f.evidence,
+      ...(f.change ? { change: f.change } : {}),
+      ...(f.dependentsCount != null ? { dependentsCount: f.dependentsCount } : {}),
+      ...(f.dependenciesCount != null ? { dependenciesCount: f.dependenciesCount } : {}),
+      ...(f.conflict ? { conflict: f.conflict } : {}),
+      ...(f.impactRelation ? { impactRelation: f.impactRelation } : {}),
+      ...(f.evidenceNote ? { evidenceNote: f.evidenceNote } : {}),
+    })),
+    sourceContext: sc
+      ? {
+          scan: sc.scan,
+          analysis: sc.analysis,
+          contextVersion: sc.contextVersion,
+          impactFile: sc.impact?.file ?? null,
+        }
+      : null,
+  };
 }
 
 /**
@@ -244,40 +380,68 @@ export async function approvePlanForOwner(
   ownerId: string,
   planId: string,
 ): Promise<{ plan: PlanDocument; createdTasks: InstanceType<typeof Task>[] }> {
-  const plan = await getPlanForOwner(ownerId, planId);
-  if (plan.status !== "needs_review") {
-    throw new AppError("This plan has already been reviewed", 409);
-  }
-  if (!plan.validation?.valid) {
-    // Should be unreachable — invalid plans are never saved — but this is
-    // the last line of defense before real data is written.
-    throw new AppError("This plan did not pass validation and cannot be approved", 422);
-  }
+  // Claim first (atomic), so concurrent approvals/rejections can't both
+  // proceed; only the winner materializes tasks.
+  const plan = await claimForReview(ownerId, planId, "approved");
 
+  // C5.1: each task keeps a copy of its evidence as it stands on the
+  // reviewed plan. Copied, never re-derived: approval does no
+  // rescan/reanalysis and cannot create evidence the plan didn't have.
   const tempIdToRealId = new Map<string, string>();
-  for (const suggested of plan.suggestedTasks) {
-    const task = await Task.create({
-      project: plan.project,
-      owner: ownerId,
-      requirement: plan.requirement,
-      title: suggested.title,
-      description: suggested.description,
-      acceptanceCriteria: suggested.acceptanceCriteria,
-      priority: suggested.priority,
-    });
-    tempIdToRealId.set(suggested.tempId, task._id.toString());
-  }
+  try {
+    // The claim above only succeeds from "needs_review", so any task that
+    // already points at this plan is a leftover of an earlier approval
+    // whose cleanup failed. Remove it so a plan never ends up with two
+    // task sets.
+    await Task.deleteMany({ "planEvidence.plan": plan._id, owner: ownerId });
+    for (const suggested of plan.suggestedTasks) {
+      const task = await Task.create({
+        project: plan.project,
+        owner: ownerId,
+        requirement: plan.requirement,
+        title: suggested.title,
+        description: suggested.description,
+        acceptanceCriteria: suggested.acceptanceCriteria,
+        priority: suggested.priority,
+        planEvidence: snapshotTaskEvidence(plan, suggested),
+      });
+      tempIdToRealId.set(suggested.tempId, task._id.toString());
+    }
 
-  for (const suggested of plan.suggestedTasks) {
-    if (suggested.dependsOn.length === 0) continue;
-    const realId = tempIdToRealId.get(suggested.tempId);
-    const dependencyIds = suggested.dependsOn.map((tempId) => tempIdToRealId.get(tempId));
-    await Task.updateOne({ _id: realId, owner: ownerId }, { $set: { dependencies: dependencyIds } });
+    for (const suggested of plan.suggestedTasks) {
+      if (suggested.dependsOn.length === 0) continue;
+      const realId = tempIdToRealId.get(suggested.tempId);
+      const dependencyIds = suggested.dependsOn.map((tempId) => tempIdToRealId.get(tempId));
+      await Task.updateOne({ _id: realId, owner: ownerId }, { $set: { dependencies: dependencyIds } });
+    }
+  } catch (err) {
+    // No multi-document transactions on this single-node deployment, so
+    // compensate: remove what was created and release the claim, leaving
+    // the plan reviewable again instead of "approved" with missing tasks.
+    // Each step is best-effort and independent — a failing cleanup must
+    // neither skip releasing the claim nor replace the original error.
+    // Anything left behind is removed by the next approval (see above).
+    try {
+      await Task.deleteMany({ _id: { $in: [...tempIdToRealId.values()] }, owner: ownerId });
+    } catch (cleanupErr) {
+      logger.error(
+        { err: cleanupErr, planId: plan._id.toString() },
+        "Approval cleanup: could not remove partial tasks",
+      );
+    }
+    try {
+      await Plan.updateOne(
+        { _id: plan._id, owner: ownerId, status: "approved" },
+        { $set: { status: "needs_review", reviewedAt: null } },
+      );
+    } catch (releaseErr) {
+      logger.error(
+        { err: releaseErr, planId: plan._id.toString() },
+        "Approval cleanup: could not release the review claim",
+      );
+    }
+    throw err;
   }
-
-  plan.status = "approved";
-  plan.reviewedAt = new Date();
-  await plan.save();
 
   // Re-fetch rather than returning the documents collected during the
   // first pass above — those predate the second pass's dependency writes,

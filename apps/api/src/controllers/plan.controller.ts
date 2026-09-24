@@ -23,6 +23,7 @@ export async function generate(req: Request, res: Response): Promise<void> {
     req.params.projectId as string,
     req.body.requirementId,
     req.body.scanId,
+    req.body.impactFile,
   );
   res.status(201).json({ plan });
 }

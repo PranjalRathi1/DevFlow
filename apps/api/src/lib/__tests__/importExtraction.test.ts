@@ -130,3 +130,49 @@ describe("extractImports", () => {
     expect(result.imports[0]).toMatchObject({ line: 4, rawImport: "./deep" });
   });
 });
+
+describe("extractImports — type-only syntax (Stage 5)", () => {
+  const sites = (src: string) => extractImports(src, "typescript").imports;
+
+  it("marks only syntax that is erased under every compiler setting", () => {
+    const result = sites(
+      [
+        `import type { A } from "./a.js";`,
+        `import { type B, c } from "./b.js";`,
+        `import { type C } from "./c.js";`,
+        `export type { D } from "./d.js";`,
+        `export { e } from "./e.js";`,
+        `import f from "./f.js";`,
+        `import "./g.js";`,
+      ].join("\n"),
+    );
+    expect(result.map((s) => [s.rawImport, s.typeOnly === true])).toEqual([
+      ["./a.js", true],
+      ["./b.js", false],
+      // All-inline `type` is NOT erased under verbatimModuleSyntax — not marked.
+      ["./c.js", false],
+      ["./d.js", true],
+      ["./e.js", false],
+      ["./f.js", false],
+      ["./g.js", false],
+    ]);
+  });
+
+  it("extracts type-position import() references as type-only, with their location", () => {
+    const result = sites(
+      `let x: typeof import("./x.js");\ntype Y = import("./y.js").Y;\nconst z = await import("./z.js");\n`,
+    );
+    expect(result).toEqual([
+      { rawImport: "./x.js", isLiteral: true, importType: "import", line: 1, column: 8, typeOnly: true },
+      { rawImport: "./y.js", isLiteral: true, importType: "import", line: 2, column: 10, typeOnly: true },
+      { rawImport: "./z.js", isLiteral: true, importType: "dynamic_import", line: 3, column: 17 },
+    ]);
+  });
+
+  it("still ignores import-like text in comments and strings", () => {
+    const result = sites(
+      `// import a from "./a.js";\nconst s = "import b from './b.js'";\n/* typeof import("./c.js") */\n`,
+    );
+    expect(result).toEqual([]);
+  });
+});

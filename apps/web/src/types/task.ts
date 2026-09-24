@@ -1,4 +1,5 @@
 import type { Priority } from "./requirement";
+import type { AffectedFile } from "./plan";
 
 export { PRIORITIES } from "./requirement";
 export type { Priority };
@@ -17,8 +18,24 @@ export interface Task {
   status: TaskStatus;
   priority: Priority;
   acceptanceCriteria: string[];
+  /** Read-only evidence copied from the AI plan this task was approved from (C5.1). */
+  planEvidence?: TaskPlanEvidence | null;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface TaskPlanEvidence {
+  plan: string;
+  tempId: string;
+  rationale: string;
+  testingApproach: string;
+  affectedFiles: AffectedFile[];
+  sourceContext: {
+    scan: string;
+    analysis: string;
+    contextVersion: number;
+    impactFile?: string | null;
+  } | null;
 }
 
 export interface TaskFormValues {

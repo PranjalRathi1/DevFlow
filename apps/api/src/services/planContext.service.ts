@@ -7,6 +7,7 @@ import { requireValidObjectId } from "./project.service.js";
 import {
   buildPlanningContext,
   observedInventoryPaths,
+  scanCoverage,
   type AffectedFileEvidenceSource,
   type PlanningContext,
 } from "../lib/planningContext.js";
@@ -29,12 +30,15 @@ export interface PlanGrounding {
  * `analysisId` pins a specific analysis (used when re-checking an edited
  * plan against the evidence it was generated from); otherwise the latest
  * analysis of the scan is used, the same one the Graph tab shows.
+ * `requirement` adds the deterministic requirement focus (C5.1); omitted
+ * when only file evidence is needed.
  */
 export async function loadPlanGrounding(
   ownerId: string,
   projectId: string,
   scanId: string,
   analysisId?: string,
+  requirement?: { title: string; description?: string | undefined },
 ): Promise<PlanGrounding> {
   const scan = await getScanForOwner(ownerId, scanId);
   if (scan.project.toString() !== projectId) {
@@ -68,6 +72,8 @@ export async function loadPlanGrounding(
     analysisId: analysis._id.toString(),
     items: scan.items,
     graph,
+    requirement,
+    limitsReached: scan.summary?.limitsReached ?? [],
   });
 
   return {
@@ -75,6 +81,10 @@ export async function loadPlanGrounding(
     analysis,
     graph,
     context,
-    evidenceSource: { inventory: observedInventoryPaths(scan.items), graph },
+    evidenceSource: {
+      inventory: observedInventoryPaths(scan.items),
+      graph,
+      coverage: scanCoverage(scan.items, scan.summary?.limitsReached ?? []),
+    },
   };
 }

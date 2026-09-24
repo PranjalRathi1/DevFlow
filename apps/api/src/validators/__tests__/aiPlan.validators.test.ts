@@ -155,7 +155,35 @@ describe("validateAIPlan — affected files and rationale (Batch C5)", () => {
     const result = validateAIPlan(
       withFiles([{ path: "src/a.ts", evidence: "in_scan", dependentsCount: 99 }]),
     );
+    // No "change" key at all: an omitted intent is not turned into a claim.
     expect(result.plan?.suggestedTasks[0]?.affectedFiles).toEqual([{ path: "src/a.ts", reason: "" }]);
+    expect(result.plan?.suggestedTasks[0]?.affectedFiles[0]).not.toHaveProperty("change");
+  });
+
+  it("accepts the C5.1 fields and rejects an unknown change intent", () => {
+    const ok = validateAIPlan(
+      validPlan({
+        suggestedTasks: [
+          {
+            tempId: "t1",
+            title: "Edit",
+            testingApproach: "Integration test in scan.integration.test.ts",
+            affectedFiles: [{ path: "src/a.ts", change: "reference" }],
+          },
+        ],
+      }),
+    );
+    expect(ok.valid).toBe(true);
+    expect(ok.plan?.suggestedTasks[0]).toMatchObject({
+      testingApproach: "Integration test in scan.integration.test.ts",
+      affectedFiles: [{ path: "src/a.ts", change: "reference" }],
+    });
+    expect(validateAIPlan(withFiles([{ path: "src/a.ts", change: "delete" }])).valid).toBe(false);
+  });
+
+  it("strips a server-only conflict note supplied as input", () => {
+    const result = validateAIPlan(withFiles([{ path: "src/a.ts", conflict: "fake" }]));
+    expect(result.plan?.suggestedTasks[0]?.affectedFiles[0]).not.toHaveProperty("conflict");
   });
 
   it("caps affected files per task", () => {

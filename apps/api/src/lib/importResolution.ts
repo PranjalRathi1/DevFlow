@@ -108,16 +108,41 @@ export function resolveImport(
     return { status: "unsupported", reason: "Alias/absolute import resolution is not implemented" };
   }
 
+  // Stage 5: ".\\foo" used to fall through to "external package". It is a
+  // path, not a package name — but backslash separators are platform-
+  // specific (not valid in ESM), so it is not resolved either.
+  if (rawImport.includes("\\")) {
+    return {
+      status: "unsupported",
+      reason: "Import specifier uses backslash path separators, which are platform-specific and not resolved",
+    };
+  }
+
   if (!isRelativeSpecifier(rawImport)) {
     // Bare specifier: "react", "express", "@scope/package" — an external
     // package reference, never treated as a local source file edge.
     return { status: "external", reason: "Bare package specifier, classified as an external dependency" };
   }
 
-  const candidate = resolveRelativeCandidate(importerRelativePath, rawImport);
-  if (candidate === null) {
+  const normalizedCandidate = resolveRelativeCandidate(importerRelativePath, rawImport);
+  if (normalizedCandidate === null) {
     return { status: "unsupported", reason: "Import target resolves outside the scanned source root" };
   }
+
+  // Stage 5: a trailing slash names a DIRECTORY ("./lib/"), so only index
+  // resolution applies — never a file named "lib" or "lib.ts".
+  if (rawImport.endsWith("/")) {
+    const dir = normalizedCandidate.replace(/\/+$/, "");
+    const index = inventory.directories.has(dir) ? resolveIndex(dir, inventory) : undefined;
+    if (index) return index;
+    return {
+      status: "unresolved",
+      reason: inventory.directories.has(dir)
+        ? "Resolved to a directory with no supported index file"
+        : "Specifier names a directory (trailing slash) that is not in the scanned inventory",
+    };
+  }
+  const candidate = normalizedCandidate;
 
   const explicitExt = path.posix.extname(candidate);
   if (explicitExt && !SUPPORTED_EXPLICIT_EXTENSIONS.has(explicitExt)) {
@@ -184,21 +209,51 @@ export function resolveImport(
   // 3. Index-file resolution — only when the specifier (with or without
   // matching an extension above) names a real directory in the inventory.
   if (inventory.directories.has(candidate)) {
-    for (const indexName of INDEX_BASENAMES) {
-      const indexPath = candidate === "" ? indexName : `${candidate}/${indexName}`;
-      if (inventory.files.has(indexPath)) {
-        return {
-          status: "confirmed",
-          resolvedRelativePath: indexPath,
-          resolutionMethod: `index:${indexName}`,
-        };
+    return (
+      resolveIndex(candidate, inventory) ?? {
+        status: "unresolved",
+        reason: "Resolved to a directory with no supported index file",
       }
-    }
-    return { status: "unresolved", reason: "Resolved to a directory with no supported index file" };
+    );
   }
 
+  const base = nodeNextUnresolvedReason ?? "No matching file found in the scanned inventory";
+  const caseHint = caseMismatch(candidate, explicitExt, inventory);
   return {
     status: "unresolved",
-    reason: nodeNextUnresolvedReason ?? "No matching file found in the scanned inventory",
+    reason: caseHint
+      ? `${base}. A file differing only in letter case exists (${caseHint}); not resolved, because case-sensitive systems would not find it`
+      : base,
   };
+}
+
+function resolveIndex(dir: string, inventory: ScanInventoryIndex): ResolvedImport | undefined {
+  for (const indexName of INDEX_BASENAMES) {
+    const indexPath = dir === "" ? indexName : `${dir}/${indexName}`;
+    if (inventory.files.has(indexPath)) {
+      return { status: "confirmed", resolvedRelativePath: indexPath, resolutionMethod: `index:${indexName}` };
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Stage 5 diagnostic only — never a resolution: the first inventory file
+ * (sorted, so deterministic) that equals one of the candidates tried when
+ * compared case-insensitively.
+ */
+function caseMismatch(
+  candidate: string,
+  explicitExt: string,
+  inventory: ScanInventoryIndex,
+): string | undefined {
+  const base = explicitExt ? candidate.slice(0, -explicitExt.length) : candidate;
+  const tried = new Set(
+    [
+      candidate,
+      ...(explicitExt ? (NODENEXT_SOURCE_EXTENSIONS[explicitExt] ?? []).map((ext) => `${base}${ext}`) : []),
+      ...(explicitExt ? [] : CANDIDATE_EXTENSIONS.map((ext) => `${candidate}${ext}`)),
+    ].map((c) => c.toLowerCase()),
+  );
+  return [...inventory.files].sort().find((f) => tried.has(f.toLowerCase()));
 }

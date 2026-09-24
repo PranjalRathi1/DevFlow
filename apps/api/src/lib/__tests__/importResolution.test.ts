@@ -370,3 +370,47 @@ describe("resolveImport — NodeNext emitted-extension mapping (Batch C2.1)", ()
     expect(confirmedCount).toBeGreaterThan(0);
   });
 });
+
+describe("resolveImport — Stage 5 accuracy fixes", () => {
+  const BS = String.fromCharCode(92); // one backslash
+
+  it("classifies a backslash path specifier as unsupported, never as an external package", () => {
+    const inv = inventory(["src/foo.ts"]);
+    for (const spec of [`.${BS}foo`, `..${BS}src${BS}foo.js`, `.${BS}foo.js`]) {
+      const result = resolveImport("src/main.ts", spec, inv);
+      expect(result.status).toBe("unsupported");
+      expect(result.reason).toMatch(/backslash/);
+      expect(result.resolvedRelativePath).toBeUndefined();
+    }
+  });
+
+  it("resolves a trailing-slash directory specifier through index files only", () => {
+    const inv = inventory(["src/lib/index.ts", "src/lib.ts"], ["src/lib"]);
+    // "./lib/" names the directory — never the sibling file src/lib.ts.
+    expect(resolveImport("src/main.ts", "./lib/", inv)).toEqual({
+      status: "confirmed",
+      resolvedRelativePath: "src/lib/index.ts",
+      resolutionMethod: "index:index.ts",
+    });
+    expect(resolveImport("src/main.ts", "./lib", inv)).toMatchObject({ resolvedRelativePath: "src/lib.ts" });
+  });
+
+  it("keeps a trailing-slash specifier unresolved when the directory or its index is missing", () => {
+    const inv = inventory(["src/lib/a.ts", "src/other.ts"], ["src/lib"]);
+    expect(resolveImport("src/main.ts", "./lib/", inv).reason).toMatch(/no supported index/);
+    expect(resolveImport("src/main.ts", "./other/", inv).reason).toMatch(/trailing slash/);
+    expect(resolveImport("src/main.ts", "./other/", inv).status).toBe("unresolved");
+  });
+
+  it("never resolves across letter case, but says when a case-mismatched file exists", () => {
+    const inv = inventory(["src/Foo.ts", "src/bar.ts"]);
+    for (const spec of ["./foo.js", "./foo", "./FOO.ts"]) {
+      const result = resolveImport("src/main.ts", spec, inv);
+      expect(result.status).toBe("unresolved");
+      expect(result.resolvedRelativePath).toBeUndefined();
+      expect(result.reason).toContain("differing only in letter case exists (src/Foo.ts)");
+    }
+    // No hint when nothing matches case-insensitively either.
+    expect(resolveImport("src/main.ts", "./baz", inv).reason).not.toMatch(/letter case/);
+  });
+});

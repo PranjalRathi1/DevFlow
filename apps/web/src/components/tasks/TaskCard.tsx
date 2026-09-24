@@ -3,6 +3,7 @@ import { Card } from "../ui/Card";
 import { PRIORITY_META, TASK_STATUS_META } from "../../lib/statusMeta";
 import { PRIORITIES, TASK_STATUSES, type Priority, type Task, type TaskStatus } from "../../types/task";
 import type { Requirement } from "../../types/requirement";
+import { AffectedFileList } from "../plans/AffectedFileList";
 
 interface TaskCardProps {
   task: Task;
@@ -44,6 +45,37 @@ export function TaskCard({
               </span>
             )}
           </div>
+          {task.planEvidence && (
+            <details className="mt-2 text-xs text-slate-600">
+              <summary className="cursor-pointer text-slate-500">
+                From an approved AI plan ·{" "}
+                {task.planEvidence.sourceContext ? "grounded in a scan" : "not grounded in a scan"} ·{" "}
+                {task.planEvidence.affectedFiles.length} file
+                {task.planEvidence.affectedFiles.length === 1 ? "" : "s"}
+              </summary>
+              {task.planEvidence.sourceContext?.impactFile && (
+                <p className="mt-1">
+                  <span className="font-semibold">Planned change target:</span>{" "}
+                  <code>{task.planEvidence.sourceContext.impactFile}</code>
+                </p>
+              )}
+              {task.planEvidence.rationale && (
+                <p className="mt-1">
+                  <span className="font-semibold">AI rationale:</span> {task.planEvidence.rationale}
+                </p>
+              )}
+              {task.planEvidence.testingApproach && (
+                <p className="mt-1">
+                  <span className="font-semibold">AI testing approach:</span>{" "}
+                  {task.planEvidence.testingApproach}
+                </p>
+              )}
+              <AffectedFileList
+                files={task.planEvidence.affectedFiles}
+                label={`Plan evidence files for ${task.title}`}
+              />
+            </details>
+          )}
         </div>
         <div className="flex shrink-0 items-center gap-1">
           {onAddSubtask && (

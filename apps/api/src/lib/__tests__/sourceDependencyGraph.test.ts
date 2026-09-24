@@ -8,6 +8,7 @@ import {
   getLeafNodes,
   getStructurallyReadyNodes,
   getStructurallyBlockedNodes,
+  getTransitiveDependents,
   type GraphInventoryFile,
   type GraphRelationshipInput,
 } from "../sourceDependencyGraph.js";
@@ -458,5 +459,65 @@ describe("purity and security", () => {
     expect(mod.topologicalOrder(result)).toEqual(["src/b.ts", "src/a.ts"]);
     vi.doUnmock("node:fs");
     vi.resetModules();
+  });
+});
+
+describe("getTransitiveDependents (bounded, C5.1 / future impact analysis)", () => {
+  // d <- c <- b <- a, plus e <- b and a cycle x <-> y hanging off d.
+  const inventory = ["a", "b", "c", "d", "e", "x", "y"].map((n) => file(`src/${n}.ts`));
+  const rels = [
+    confirmed("src/a.ts", "src/b.ts"),
+    confirmed("src/b.ts", "src/c.ts"),
+    confirmed("src/e.ts", "src/c.ts"),
+    confirmed("src/c.ts", "src/d.ts"),
+    confirmed("src/x.ts", "src/d.ts"),
+    confirmed("src/x.ts", "src/y.ts"),
+    confirmed("src/y.ts", "src/x.ts"),
+    nonConfirmed("unresolved", "src/y.ts", { rawImport: "./d-maybe", resolvedRelativePath: undefined }),
+  ];
+  const graph = buildDependencyGraph(inventory, rels);
+  const wide = { maxDepth: 10, maxNodes: 100 };
+
+  it("walks incoming confirmed edges level by level with depth and via", () => {
+    expect(getTransitiveDependents(graph, "src/d.ts", wide)).toEqual({
+      dependents: [
+        { id: "src/c.ts", depth: 1, via: "src/d.ts" },
+        { id: "src/x.ts", depth: 1, via: "src/d.ts" },
+        { id: "src/b.ts", depth: 2, via: "src/c.ts" },
+        { id: "src/e.ts", depth: 2, via: "src/c.ts" },
+        { id: "src/y.ts", depth: 2, via: "src/x.ts" },
+        { id: "src/a.ts", depth: 3, via: "src/b.ts" },
+      ],
+      truncated: false,
+    });
+  });
+
+  it("agrees with getDirectDependents at depth 1", () => {
+    const depth1 = getTransitiveDependents(graph, "src/d.ts", { maxDepth: 1, maxNodes: 100 });
+    expect(depth1.dependents.map((d) => d.id)).toEqual(getDirectDependents(graph, "src/d.ts"));
+    expect(depth1.truncated).toBe(true);
+  });
+
+  it("is cycle-safe and never lists the start node as its own dependent", () => {
+    const fromX = getTransitiveDependents(graph, "src/x.ts", wide);
+    expect(fromX).toEqual({ dependents: [{ id: "src/y.ts", depth: 1, via: "src/x.ts" }], truncated: false });
+  });
+
+  it("reports truncation when the node cap cuts results", () => {
+    const capped = getTransitiveDependents(graph, "src/d.ts", { maxDepth: 10, maxNodes: 3 });
+    expect(capped.dependents.map((d) => d.id)).toEqual(["src/c.ts", "src/x.ts", "src/b.ts"]);
+    expect(capped.truncated).toBe(true);
+  });
+
+  it("returns nothing for a leaf importer or an unknown node, without truncation", () => {
+    expect(getTransitiveDependents(graph, "src/a.ts", wide)).toEqual({ dependents: [], truncated: false });
+    expect(getTransitiveDependents(graph, "src/nope.ts", wide)).toEqual({ dependents: [], truncated: false });
+  });
+
+  it("is deterministic regardless of relationship order", () => {
+    const reversed = buildDependencyGraph([...inventory].reverse(), [...rels].reverse());
+    expect(getTransitiveDependents(reversed, "src/d.ts", wide)).toEqual(
+      getTransitiveDependents(graph, "src/d.ts", wide),
+    );
   });
 });

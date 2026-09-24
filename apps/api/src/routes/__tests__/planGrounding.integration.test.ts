@@ -180,8 +180,9 @@ describe.skipIf(!dbAvailable)("Scan-grounded plan generation (real MongoDB, mock
     mockProviderReturning(
       planJson([
         { path: "src/util.ts", reason: "add cache" },
-        { path: "src/cache.ts", reason: "new module", evidence: "in_scan" },
-        { path: "./src\\index.ts" },
+        { path: "src/cache.ts", reason: "new module", change: "create", evidence: "in_scan" },
+        { path: "./src\\index.ts", change: "reference" },
+        { path: "src/ghost.ts", change: "modify" },
       ]),
     );
     const res = await generate({ requirementId, scanId }).expect(201);
@@ -191,13 +192,17 @@ describe.skipIf(!dbAvailable)("Scan-grounded plan generation (real MongoDB, mock
     expect(plan.sourceContext).toMatchObject({
       scan: scanId,
       analysis: analysisId,
-      contextVersion: 2,
+      contextVersion: 3,
       truncated: false,
       counts: { files: 3, graphNodes: 2, confirmedEdges: 1, unresolved: 1, external: 1, unsupported: 1 },
+      // Requirement "Add caching" matches no path in this fixture.
+      focusTerms: ["cach"],
+      focusFiles: [],
     });
     const [task] = plan.suggestedTasks;
     expect(task.rationale).toContain("confirmed");
     expect(task.affectedFiles).toEqual([
+      // No intent stated by the AI -> none recorded (not a defaulted "modify").
       {
         path: "src/util.ts",
         reason: "add cache",
@@ -206,8 +211,23 @@ describe.skipIf(!dbAvailable)("Scan-grounded plan generation (real MongoDB, mock
         dependenciesCount: 0,
       },
       // The AI's own "in_scan" claim was ignored — the file isn't in the scan.
-      { path: "src/cache.ts", reason: "new module", evidence: "not_in_scan" },
-      { path: "src/index.ts", reason: "", evidence: "in_scan", dependentsCount: 0, dependenciesCount: 1 },
+      { path: "src/cache.ts", reason: "new module", change: "create", evidence: "not_in_scan" },
+      {
+        path: "src/index.ts",
+        reason: "",
+        change: "reference",
+        evidence: "in_scan",
+        dependentsCount: 0,
+        dependenciesCount: 1,
+      },
+      // A claim the scan contradicts is kept but flagged, never "confirmed".
+      {
+        path: "src/ghost.ts",
+        reason: "",
+        change: "modify",
+        evidence: "not_in_scan",
+        conflict: 'Claimed "modify", but this path is not in the scan',
+      },
     ]);
     expect(JSON.stringify(res.body)).not.toContain(scratchBase);
 
@@ -312,15 +332,326 @@ describe.skipIf(!dbAvailable)("Scan-grounded plan generation (real MongoDB, mock
     ).toEqual(["not_in_scan", "in_scan"]);
   });
 
-  it("keeps the existing review flow: a grounded plan can be approved into tasks", async () => {
-    mockProviderReturning(planJson([{ path: "src/util.ts" }]));
-    const planId = (await generate({ requirementId, scanId }).expect(201)).body.plan._id;
-    const res = await request(app)
-      .post(`/api/plans/${planId}/approve`)
-      .set("Cookie", userA.cookie)
-      .expect(200);
-    expect(res.body.plan.status).toBe("approved");
-    expect(res.body.createdTasks).toHaveLength(2);
+  describe("lifecycle races (Stage 1)", () => {
+    const approve = (id: string) => request(app).post(`/api/plans/${id}/approve`).set("Cookie", userA.cookie);
+    const reject = (id: string) => request(app).post(`/api/plans/${id}/reject`).set("Cookie", userA.cookie);
+
+    it("concurrent approvals create the tasks exactly once", async () => {
+      mockProviderReturning(planJson([{ path: "src/util.ts", change: "modify" }]));
+      const plan = (await generate({ requirementId, scanId }).expect(201)).body.plan;
+
+      const results = await Promise.all([approve(plan._id), approve(plan._id), approve(plan._id)]);
+      expect(results.map((r) => r.status).sort()).toEqual([200, 409, 409]);
+      const tasks = await Task.find({ "planEvidence.plan": plan._id });
+      expect(tasks).toHaveLength(plan.suggestedTasks.length);
+    });
+
+    it("an approval racing a rejection leaves exactly one consistent outcome", async () => {
+      mockProviderReturning(planJson([]));
+      const plan = (await generate({ requirementId, scanId }).expect(201)).body.plan;
+
+      const [a, r] = await Promise.all([approve(plan._id), reject(plan._id)]);
+      expect([a.status, r.status].sort()).toEqual([200, 409]);
+      const stored = await Plan.findById(plan._id);
+      const tasks = await Task.countDocuments({ "planEvidence.plan": plan._id });
+      if (a.status === 200) {
+        expect(stored?.status).toBe("approved");
+        expect(tasks).toBe(plan.suggestedTasks.length);
+      } else {
+        expect(stored?.status).toBe("rejected");
+        expect(tasks).toBe(0);
+      }
+    });
+
+    it("survives a failed cleanup: the original error surfaces and a later approval ends with exactly one task set", async () => {
+      mockProviderReturning(planJson([{ path: "src/util.ts" }]));
+      const plan = (await generate({ requirementId, scanId }).expect(201)).body.plan;
+      const realCreate = Task.create.bind(Task);
+      let calls = 0;
+      const createSpy = vi.spyOn(Task, "create").mockImplementation(((
+        ...args: Parameters<typeof Task.create>
+      ) => {
+        calls += 1;
+        if (calls === 2) return Promise.reject(new Error("simulated write failure"));
+        return realCreate(...args);
+      }) as typeof Task.create);
+      // The compensating delete fails too (e.g. the connection dropped). Call 1
+      // is approval's leftover sweep; call 2 is the compensation.
+      const realDeleteMany = Task.deleteMany.bind(Task);
+      let deletes = 0;
+      const deleteSpy = vi.spyOn(Task, "deleteMany").mockImplementation(((
+        ...args: Parameters<typeof Task.deleteMany>
+      ) => {
+        deletes += 1;
+        if (deletes === 2) return Promise.reject(new Error("cleanup failed"));
+        return realDeleteMany(...args);
+      }) as unknown as typeof Task.deleteMany);
+      try {
+        const res = await approve(plan._id);
+        expect(res.status).toBe(500);
+      } finally {
+        createSpy.mockRestore();
+        deleteSpy.mockRestore();
+      }
+      // The claim is still released so the plan can be reviewed again...
+      expect((await Plan.findById(plan._id))?.status).toBe("needs_review");
+      // ...one orphan from the failed attempt remains for now...
+      expect(await Task.countDocuments({ "planEvidence.plan": plan._id })).toBe(1);
+      // ...and the next successful approval replaces it rather than duplicating.
+      await approve(plan._id).expect(200);
+      expect(await Task.countDocuments({ "planEvidence.plan": plan._id })).toBe(plan.suggestedTasks.length);
+    });
+
+    it("a failure mid-approval leaves the plan reviewable and no orphan tasks", async () => {
+      mockProviderReturning(planJson([{ path: "src/util.ts" }]));
+      const plan = (await generate({ requirementId, scanId }).expect(201)).body.plan;
+      const realCreate = Task.create.bind(Task);
+      let calls = 0;
+      const spy = vi.spyOn(Task, "create").mockImplementation(((...args: Parameters<typeof Task.create>) => {
+        calls += 1;
+        if (calls === 2) return Promise.reject(new Error("simulated write failure"));
+        return realCreate(...args);
+      }) as typeof Task.create);
+      try {
+        const res = await approve(plan._id);
+        expect(res.status).toBe(500);
+      } finally {
+        spy.mockRestore();
+      }
+      const stored = await Plan.findById(plan._id);
+      expect(stored?.status).toBe("needs_review");
+      expect(stored?.reviewedAt).toBeNull();
+      expect(await Task.countDocuments({ "planEvidence.plan": plan._id })).toBe(0);
+      // ...and it can still be approved normally afterwards.
+      await approve(plan._id).expect(200);
+      expect(await Task.countDocuments({ "planEvidence.plan": plan._id })).toBe(plan.suggestedTasks.length);
+    });
+
+    it("loads a C5-era plan (no change intent stored) without inventing one", async () => {
+      const { insertedId: _id } = await Plan.collection.insertOne({
+        project: new Plan.base.Types.ObjectId(projectId),
+        owner: new Plan.base.Types.ObjectId(userA.userId),
+        requirement: new Plan.base.Types.ObjectId(requirementId),
+        status: "needs_review",
+        title: "Legacy plan",
+        summary: "Generated before C5.1",
+        assumptions: [],
+        risks: [],
+        suggestedTasks: [
+          {
+            tempId: "t1",
+            title: "Legacy task",
+            description: "",
+            acceptanceCriteria: [],
+            priority: "medium",
+            dependsOn: [],
+            rationale: "",
+            affectedFiles: [{ path: "src/util.ts", reason: "", evidence: "in_scan", dependentsCount: 1 }],
+          },
+        ],
+        suggestedOrder: ["t1"],
+        validation: { valid: true, errors: [] },
+        aiMeta: { provider: "ollama", model: "m", generatedAt: new Date(), durationMs: 1 },
+        sourceContext: null,
+        reviewedAt: null,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      });
+      const loaded = (await request(app).get(`/api/plans/${_id}`).set("Cookie", userA.cookie).expect(200))
+        .body.plan;
+      const [file] = loaded.suggestedTasks[0].affectedFiles;
+      expect(file).not.toHaveProperty("change");
+      expect(file).not.toHaveProperty("conflict");
+      expect(file.evidence).toBe("in_scan");
+
+      const approved = (await approve(String(_id)).expect(200)).body;
+      expect(approved.createdTasks[0].planEvidence.affectedFiles[0]).not.toHaveProperty("change");
+    });
+
+    it("stores each task's evidence equal to the plan's, as read back from MongoDB", async () => {
+      mockProviderReturning(
+        planJson([
+          { path: "src/util.ts", change: "modify", reason: "r1" },
+          { path: "src/new.ts", change: "create" },
+          { path: "src/gone.ts", change: "reference" },
+        ]),
+      );
+      const plan = (await generate({ requirementId, scanId }).expect(201)).body.plan;
+      await approve(plan._id).expect(200);
+
+      const storedPlan = await Plan.findById(plan._id).lean();
+      const storedTasks = await Task.find({ "planEvidence.plan": plan._id }).lean();
+      expect(storedTasks).toHaveLength(storedPlan!.suggestedTasks.length);
+      for (const task of storedTasks) {
+        const source = storedPlan!.suggestedTasks.find((s) => s.tempId === task.planEvidence!.tempId)!;
+        expect(task.planEvidence!.affectedFiles).toEqual(source.affectedFiles);
+        expect(task.planEvidence!.rationale).toBe(source.rationale);
+        expect(String(task.planEvidence!.sourceContext!.scan)).toBe(String(storedPlan!.sourceContext!.scan));
+        expect(String(task.planEvidence!.sourceContext!.analysis)).toBe(
+          String(storedPlan!.sourceContext!.analysis),
+        );
+      }
+    });
+
+    it("an edit that loses the race to approval is refused, not applied after the fact", async () => {
+      mockProviderReturning(planJson([]));
+      const plan = (await generate({ requirementId, scanId }).expect(201)).body.plan;
+
+      const [edit, approval] = await Promise.all([
+        request(app)
+          .patch(`/api/plans/${plan._id}`)
+          .set("Cookie", userA.cookie)
+          .send({ title: "Edited during approval" }),
+        approve(plan._id),
+      ]);
+      expect(approval.status).toBe(200);
+      const stored = await Plan.findById(plan._id);
+      expect(stored?.status).toBe("approved");
+      if (edit.status === 200) {
+        // The edit won the race: it must have landed BEFORE approval, so the
+        // approved tasks were created from the edited plan.
+        expect(stored?.title).toBe("Edited during approval");
+      } else {
+        expect(edit.status).toBe(409);
+        expect(stored?.title).toBe(plan.title);
+      }
+    });
+  });
+
+  describe("full lifecycle: generate → review → approve (C5.1)", () => {
+    const aiFiles = [
+      { path: "src/util.ts", reason: "wrap in cache", change: "modify" },
+      { path: "src/cache.ts", reason: "new module", change: "create", evidence: "in_scan" },
+      { path: "src/ghost.ts", change: "reference" },
+    ];
+
+    async function evidenceCounts() {
+      return {
+        scans: await Scan.countDocuments({ project: projectId }),
+        analyses: await Analysis.countDocuments({ scan: scanId }),
+      };
+    }
+
+    it("carries server-verified evidence unchanged from generation through review and approval", async () => {
+      mockProviderReturning(
+        JSON.stringify({
+          ...JSON.parse(planJson(aiFiles)),
+          suggestedTasks: [
+            {
+              ...JSON.parse(planJson(aiFiles)).suggestedTasks[0],
+              testingApproach: "Unit test next to util",
+            },
+            { tempId: "t2", title: "Add tests", dependsOn: ["t1"] },
+          ],
+        }),
+      );
+      const generated = (await generate({ requirementId, scanId }).expect(201)).body.plan;
+      const generatedFiles = generated.suggestedTasks[0].affectedFiles;
+      expect(generatedFiles.map((f: { evidence: string }) => f.evidence)).toEqual([
+        "in_scan",
+        "not_in_scan",
+        "not_in_scan",
+      ]);
+      const countsBefore = await evidenceCounts();
+
+      // Review: the fetched plan is exactly what was generated.
+      const reviewed = (
+        await request(app).get(`/api/plans/${generated._id}`).set("Cookie", userA.cookie).expect(200)
+      ).body.plan;
+      expect(reviewed.suggestedTasks).toEqual(generated.suggestedTasks);
+      expect(reviewed.sourceContext).toEqual(generated.sourceContext);
+
+      // A metadata-only review edit leaves evidence untouched.
+      await request(app)
+        .patch(`/api/plans/${generated._id}`)
+        .set("Cookie", userA.cookie)
+        .send({ title: "Add caching (reviewed)" })
+        .expect(200);
+
+      const approved = (
+        await request(app).post(`/api/plans/${generated._id}/approve`).set("Cookie", userA.cookie).expect(200)
+      ).body;
+      expect(approved.plan.status).toBe("approved");
+      expect(approved.plan.reviewedAt).not.toBeNull();
+
+      // Each task holds a verbatim copy of its plan task's evidence.
+      const t1 = approved.createdTasks.find((t: { title: string }) => t.title === "Wrap util in a cache");
+      expect(t1.planEvidence).toEqual({
+        plan: generated._id,
+        tempId: "t1",
+        rationale: generated.suggestedTasks[0].rationale,
+        testingApproach: "Unit test next to util",
+        affectedFiles: generatedFiles,
+        sourceContext: {
+          scan: scanId,
+          analysis: analysisId,
+          contextVersion: generated.sourceContext.contextVersion,
+          impactFile: null, // this plan had no impact target
+        },
+      });
+      // The AI's "in_scan" claim for src/cache.ts did not survive anywhere.
+      expect(t1.planEvidence.affectedFiles[1]).toMatchObject({
+        path: "src/cache.ts",
+        evidence: "not_in_scan",
+      });
+      expect(t1.planEvidence.affectedFiles[2].conflict).toMatch(/not in the scan/);
+      const t2 = approved.createdTasks.find((t: { title: string }) => t.title === "Add tests");
+      expect(t2.planEvidence).toMatchObject({ tempId: "t2", affectedFiles: [] });
+
+      // The approved plan still has all of it.
+      const after = (
+        await request(app).get(`/api/plans/${generated._id}`).set("Cookie", userA.cookie).expect(200)
+      ).body.plan;
+      expect(after.suggestedTasks).toEqual(generated.suggestedTasks);
+      expect(after.sourceContext).toEqual(generated.sourceContext);
+
+      // Approval neither re-scanned nor re-analysed.
+      expect(await evidenceCounts()).toEqual(countsBefore);
+
+      // Evidence is read-only through the task API.
+      const patched = (
+        await request(app)
+          .patch(`/api/tasks/${t1._id}`)
+          .set("Cookie", userA.cookie)
+          .send({
+            status: "in_progress",
+            planEvidence: { affectedFiles: [{ path: "src/cache.ts", evidence: "in_scan" }] },
+          })
+          .expect(200)
+      ).body.task;
+      expect(patched.status).toBe("in_progress");
+      expect(patched.planEvidence).toEqual(t1.planEvidence);
+
+      // A reviewed plan can't be approved twice or edited afterwards.
+      await request(app).post(`/api/plans/${generated._id}/approve`).set("Cookie", userA.cookie).expect(409);
+    });
+
+    it("keeps an ungrounded plan's references unverified through approval", async () => {
+      mockProviderReturning(planJson([{ path: "src/util.ts", change: "modify" }]));
+      const plan = (await generate({ requirementId }).expect(201)).body.plan;
+      const approved = (
+        await request(app).post(`/api/plans/${plan._id}/approve`).set("Cookie", userA.cookie).expect(200)
+      ).body;
+      const t1 = approved.createdTasks.find((t: { title: string }) => t.title === "Wrap util in a cache");
+      expect(t1.planEvidence.sourceContext).toBeNull();
+      expect(t1.planEvidence.affectedFiles).toEqual([
+        { path: "src/util.ts", reason: "", change: "modify", evidence: "unverified" },
+      ]);
+    });
+
+    it("rejection keeps the plan's evidence and creates no tasks", async () => {
+      mockProviderReturning(planJson(aiFiles));
+      const plan = (await generate({ requirementId, scanId }).expect(201)).body.plan;
+      const tasksBefore = await Task.countDocuments({ project: projectId });
+      const rejected = (
+        await request(app).post(`/api/plans/${plan._id}/reject`).set("Cookie", userA.cookie).expect(200)
+      ).body.plan;
+      expect(rejected.status).toBe("rejected");
+      expect(rejected.suggestedTasks).toEqual(plan.suggestedTasks);
+      expect(rejected.sourceContext).toEqual(plan.sourceContext);
+      expect(await Task.countDocuments({ project: projectId })).toBe(tasksBefore);
+      await request(app).post(`/api/plans/${plan._id}/approve`).set("Cookie", userA.cookie).expect(409);
+    });
   });
 
   it("never modifies the scanned source project", async () => {

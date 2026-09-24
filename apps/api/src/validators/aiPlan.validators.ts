@@ -42,9 +42,17 @@ export const proposedPathSchema = z
 // Only path + reason are accepted from the AI (or a human edit). Whether a
 // file exists in the scan is computed server-side — an `evidence` field
 // supplied here is stripped by Zod, never trusted.
+// The AI's stated intent for a file. A CLAIM, not evidence — the server
+// flags it (`conflict`) when the scan contradicts it.
+export const AFFECTED_FILE_CHANGES = ["modify", "create", "test", "reference"] as const;
+export type AffectedFileChange = (typeof AFFECTED_FILE_CHANGES)[number];
+
 const affectedFileInputSchema = z.object({
   path: proposedPathSchema,
   reason: z.string().trim().max(500).optional().default(""),
+  // No default: an omitted intent is recorded as "no claim", never as a
+  // claim the AI didn't make (a default would also trigger false conflicts).
+  change: z.enum(AFFECTED_FILE_CHANGES).optional(),
 });
 
 const suggestedTaskSchema = z.object({
@@ -55,6 +63,7 @@ const suggestedTaskSchema = z.object({
   priority: z.enum(PRIORITIES).optional().default("medium"),
   dependsOn: z.array(tempIdSchema).max(MAX_LIST_ITEMS).optional().default([]),
   rationale: z.string().trim().max(1000).optional().default(""),
+  testingApproach: z.string().trim().max(1000).optional().default(""),
   affectedFiles: z.array(affectedFileInputSchema).max(MAX_AFFECTED_FILES).optional().default([]),
 });
 

@@ -31,6 +31,8 @@ const relationshipSchema = new Schema(
     line: { type: Number },
     column: { type: Number },
     status: { type: String, enum: RELATIONSHIP_STATUSES, required: true },
+    // Stage 5: syntax proves the import is erased at runtime (see importExtraction.ts).
+    typeOnly: { type: Boolean },
     resolvedRelativePath: { type: String },
     resolutionMethod: { type: String },
     reason: { type: String },

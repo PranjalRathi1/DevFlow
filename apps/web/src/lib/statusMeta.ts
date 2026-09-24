@@ -2,7 +2,7 @@ import type { BadgeTone } from "../components/ui/Badge";
 import type { ProjectStatus } from "../types/project";
 import type { RequirementStatus, Priority } from "../types/requirement";
 import type { TaskStatus } from "../types/task";
-import type { AffectedFileEvidence, PlanStatus } from "../types/plan";
+import type { AffectedFileChange, AffectedFileEvidence, ImpactRelation, PlanStatus } from "../types/plan";
 import type { ScanOutcome } from "../types/scan";
 import type { NonConfirmedStatus } from "../types/graph";
 
@@ -38,6 +38,23 @@ export const AFFECTED_FILE_EVIDENCE_META: Record<AffectedFileEvidence, { label: 
   in_scan: { label: "In scan", tone: "success" },
   not_in_scan: { label: "Not in scan — proposed", tone: "warning" },
   unverified: { label: "Unverified", tone: "neutral" },
+};
+
+export const AFFECTED_FILE_CHANGE_LABELS: Record<AffectedFileChange, string> = {
+  modify: "modify",
+  create: "create new file",
+  test: "test",
+  reference: "follow its pattern (no change)",
+};
+
+// Worded as possibilities, never obligations: an import edge does not
+// prove runtime use, and "may be affected" does not mean "must change".
+export const IMPACT_RELATION_LABELS: Record<ImpactRelation, string> = {
+  target: "the planned change target",
+  dependency: "imported by the target (changing the target does not affect it)",
+  direct_dependent: "imports the target directly (may be affected)",
+  transitive_dependent: "reaches the target through imports (may be affected)",
+  dependency_and_dependent: "imports the target and is imported by it — a cycle (may be affected)",
 };
 
 export const SCAN_OUTCOME_META: Record<ScanOutcome, { label: string; tone: BadgeTone }> = {
