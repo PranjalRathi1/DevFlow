@@ -1,18 +1,32 @@
 node_modules/
 dist/
 build/
+
+# Environment files
 .env
-.env.local
-.env.*.local
+.env.*
+!.env.example
+
+# Logs
 *.log
 npm-debug.log*
+
+# Testing and coverage
 coverage/
-.DS_Store
-Thumbs.db
-.vscode/*
-!.vscode/extensions.json
-*.tsbuildinfo
-.turbo/
 playwright-report/
 test-results/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor files
+.vscode/*
+!.vscode/extensions.json
+
+# Build and tooling
+*.tsbuildinfo
+.turbo/
+
+# Local database data
 mongo-data/
