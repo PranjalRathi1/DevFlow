@@ -12,6 +12,7 @@
     "node": ">=20"
   },
   "scripts": {
+    "dev": "tsx packages/launcher/src/cli.ts",
     "dev:api": "npm run dev --workspace apps/api",
     "dev:web": "npm run dev --workspace apps/web",
     "db:up": "docker compose up -d mongo",

@@ -1,0 +1,12 @@
+{
+  "name": "@devflow/launcher",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Starts DevFlow and the local services it needs; stops only what it started",
+  "scripts": {
+    "start": "tsx src/cli.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run"
+  }
+}

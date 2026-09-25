@@ -32,8 +32,8 @@ See `PROJECT_DECISIONS.md` for current status and
 
 - Node.js ≥ 20 (developed against v24.19.0)
 - npm ≥ 11 (workspaces)
-- Docker Desktop (for local MongoDB) — **must be running** before
-  `docker compose up` / `npm run db:up`
+- Docker Desktop (for local MongoDB). `npm run dev` starts it if needed;
+  for the manual commands it must be running before `npm run db:up`
 - [Ollama](https://ollama.com) running locally with a model pulled
   (developed against `qwen2.5:7b`: `ollama pull qwen2.5:7b`) — only needed
   for actually generating AI plans through the running app; the automated
@@ -47,6 +47,15 @@ cp .env.example .env
 # Edit .env: set MONGO_ROOT_USERNAME/MONGO_ROOT_PASSWORD and a matching
 # MONGODB_URI. Do NOT set NODE_ENV here — see docs/DECISIONS.md ADR-006.
 
+npm run dev           # starts Docker, MongoDB and Ollama if needed, then the API and web
+```
+
+`npm run dev` starts only what is not already running, and on Ctrl+C stops
+only what it started. MongoDB data is always kept, and Docker Desktop is
+left running. See `docs/LAUNCHER.md` for how it decides, its settings, and
+troubleshooting. To run the pieces by hand instead:
+
+```bash
 npm run db:up        # starts MongoDB in Docker (needs Docker Desktop running)
 npm run dev:api       # http://localhost:4000
 npm run dev:web       # http://localhost:5173
@@ -74,6 +83,7 @@ npm run db:reset     # stop MongoDB AND delete its data volume — destructive
 apps/web/       React + TypeScript + Vite frontend
 apps/api/       Express + TypeScript backend (incl. AI provider abstraction,
                  the dependency graph engine, and the read-only project scanner)
+packages/launcher/ `npm run dev`: starts and stops DevFlow and its services (docs/LAUNCHER.md)
 packages/shared/ still empty — no cross-package consumer yet (see ADR-010)
 docs/           Architecture, API, security, testing, and decision docs
 ```

@@ -1632,3 +1632,91 @@ Findings:
 
 DevFlow labels what it can check. It does not judge design quality or
 framework conventions.
+
+## ADR-031: A launcher that owns only what it starts
+
+**Problem**: running DevFlow meant starting Docker Desktop, MongoDB
+(`npm run db:up`), Ollama, the API and the web app by hand, every time.
+
+**Decision**: `npm run dev` runs `packages/launcher`, a new workspace
+that starts only what is not already available and cleans up only what
+it started. See `docs/LAUNCHER.md` for the user-facing behaviour.
+
+- **Ownership is proven in memory, never read from a file.**
+  - A dependency is "owned" only after this launcher process started it
+    successfully. Anything already running is "external" and is never
+    stopped.
+  - For Ollama and the app processes, ownership is the exact child-process
+    handle. Stopping targets that process ID and its subprocesses, never a
+    process name, so the Ollama desktop app and any other `ollama.exe`
+    are safe.
+- **MongoDB.** Every Compose call names the project, directory and file
+  explicitly. Start is `up --detach --no-recreate mongo`; stop is
+  `stop mongo`. There is no `down`, `-v`, `rm` or `prune` anywhere in
+  the launcher; a test scans the source for them, and another checks every
+  command run in every scenario. The existing `db:reset` script still
+  exists for an explicit, deliberate reset.
+- **Docker Desktop is never closed**, even when DevFlow launched it,
+  because it is shared with other containers and tools.
+- **Ollama.**
+  - The launcher starts `ollama serve` only for a loopback
+    `OLLAMA_BASE_URL`, and in its own process group/console, so a Ctrl+C
+    reaches it only through the launcher's cleanup.
+  - The model comes from `OLLAMA_MODEL` and is never pulled
+    automatically; a missing model fails startup with the exact
+    `ollama pull` command.
+- **Cleanup** is one idempotent function (a second signal gets the same
+  promise), in the order apps, then owned MongoDB, then owned Ollama. It
+  runs on SIGINT/SIGTERM/SIGHUP, startup failure, and an unexpected
+  API/web exit. A synchronous last-resort handler runs on process exit.
+- **Testability.** All side effects go through a `System` interface, so
+  the lifecycle is unit-tested against a fake machine, never the user's
+  Docker or Ollama.
+
+**Verified**: 43 unit tests, and 12 deliberately broken versions of the
+lifecycle code, all caught by the tests. The broken versions:
+
+- stopping an external MongoDB
+- starting a second Ollama
+- a non-idempotent cleanup
+- `compose down`
+- launching Docker Desktop when Docker is already ready
+- a skipped model check
+- no cleanup after a startup failure
+- a duplicate API
+- treating a foreign Ollama as owned
+- `up` recreating the container
+- never stopping an owned Ollama
+- emergency cleanup stopping an external MongoDB
+
+_Alternatives rejected_:
+
+- a PID or ownership file, because a stale file could make DevFlow kill a
+  reused PID
+- `docker compose down`, because it removes containers and invites `-v`
+- killing by image name
+- closing Docker Desktop
+- auto-pulling models, because of bandwidth, disk use and consent
+
+**Review follow-up (ADR-031)**:
+
+- **Startup/cleanup race.** A signal arriving mid-step (e.g. during
+  `compose up`) used to let cleanup run before that step recorded
+  ownership. Cleanup now waits for the in-flight step to settle, and no app
+  process is spawned once shutdown has begun.
+- **Ctrl+C during startup** now exits 0 instead of being reported as a
+  startup failure.
+- **App ports.** A process on an app port is adopted as DevFlow only if it
+  answers like DevFlow: the API's health JSON shape, or the web app's
+  `<title>`. Any other listener (HTTP or plain TCP) fails startup with a
+  clear message and is never adopted or stopped.
+- **Exit handler.** It is documented as a best-effort, synchronous last
+  resort. Closing the console window, and forced kills, don't get a
+  guaranteed cleanup.
+- **Tests.** 13 review tests cover these fixes, the MongoDB stop/restart
+  cycle, and the full owned-resource scenario (ownership recorded only
+  after success, unrelated processes and volumes untouched).
+- **Mutation checks.** Of the 12 deliberately broken versions, 11 still
+  apply to the refactored code and all are caught; one (L8) no longer
+  applies because the code it targeted was replaced. 6 new ones targeting
+  the review fixes are also all caught.

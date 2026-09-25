@@ -33,6 +33,13 @@ export default tseslint.config(
       "react-refresh/only-export-components": ["warn", { allowConstantExport: true }],
     },
   },
+  // Launcher (Node)
+  {
+    files: ["packages/launcher/**/*.ts"],
+    languageOptions: {
+      globals: globals.node,
+    },
+  },
   // Shared package
   {
     files: ["packages/shared/**/*.ts"],
